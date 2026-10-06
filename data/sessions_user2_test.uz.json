@@ -1,0 +1,18 @@
+[
+  {
+    "id": "session-1791278870390",
+    "title": "Yangi suhbat",
+    "createdAt": "2026-10-06T09:27:50.390Z",
+    "updatedAt": "2026-10-06T09:27:50.390Z",
+    "userEmail": "user2@test.uz",
+    "messages": [
+      {
+        "id": "msg-1791278870390",
+        "role": "assistant",
+        "content": "Assalomu alaykum! Yangi suhbat boshlandi. Men **UZUNITED AI** man. Sizga qanday yordam bera olaman?",
+        "timestamp": "2026-10-06T09:27:50.390Z"
+      }
+    ],
+    "entityMemory": {}
+  }
+]

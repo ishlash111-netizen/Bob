@@ -1,5 +1,6 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 
@@ -71,6 +72,66 @@ export interface UserProfileData {
   learnedPreferences?: string[];
 }
 
+// Persistent user storage on disk
+const DATA_DIR = path.join(process.cwd(), "data");
+const USERS_FILE = path.join(DATA_DIR, "users_db.json");
+const ACTIVE_USER_FILE = path.join(DATA_DIR, "active_user.json");
+
+if (!fs.existsSync(DATA_DIR)) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  } catch {}
+}
+
+function loadSavedUsers(): Record<string, { profile: UserProfileData; passwordHash?: string }> {
+  try {
+    if (fs.existsSync(USERS_FILE)) {
+      const content = fs.readFileSync(USERS_FILE, "utf-8");
+      return JSON.parse(content);
+    }
+  } catch (e) {
+    console.warn("Could not read users_db.json:", e);
+  }
+  return {};
+}
+
+function saveUsers(users: Record<string, { profile: UserProfileData; passwordHash?: string }>) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), "utf-8");
+  } catch (e) {
+    console.warn("Could not write users_db.json:", e);
+  }
+}
+
+function loadActiveUser(): UserProfileData | null {
+  try {
+    if (fs.existsSync(ACTIVE_USER_FILE)) {
+      const content = fs.readFileSync(ACTIVE_USER_FILE, "utf-8");
+      return JSON.parse(content);
+    }
+  } catch (e) {
+    console.warn("Could not read active_user.json:", e);
+  }
+  return null;
+}
+
+function saveActiveUser(user: UserProfileData | null) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (user) {
+      fs.writeFileSync(ACTIVE_USER_FILE, JSON.stringify(user, null, 2), "utf-8");
+    } else if (fs.existsSync(ACTIVE_USER_FILE)) {
+      fs.unlinkSync(ACTIVE_USER_FILE);
+    }
+  } catch (e) {
+    console.warn("Could not write active_user.json:", e);
+  }
+}
+
+const SESSIONS_FILE = path.join(DATA_DIR, "chat_sessions.json");
+const AI_MEMORY_FILE = path.join(DATA_DIR, "ai_memory.json");
+
 interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "system";
@@ -94,29 +155,280 @@ interface ChatSession {
   title: string;
   createdAt: string;
   updatedAt: string;
+  userEmail?: string;
   messages: ChatMessage[];
   entityMemory: Record<string, string>; // e.g. "u": "Sam Altman", "birinchisi": "Python"
 }
 
-const memoryStore: Map<string, ChatSession> = new Map();
+interface MemoryRecord {
+  id: string;
+  fact: string;
+  category: "preference" | "fact" | "work" | "bio" | "general";
+  createdAt: string;
+}
 
-// Initialize sample default session
+interface AiMemoryData {
+  facts: MemoryRecord[];
+  userSummary?: string;
+  lastUpdated?: string;
+}
+
 const defaultSessionId = "default-uzunited-session";
-memoryStore.set(defaultSessionId, {
-  id: defaultSessionId,
-  title: "UZUNITED AI Boshlang'ich Suhbat",
-  createdAt: new Date().toISOString(),
-  updatedAt: new Date().toISOString(),
-  messages: [
-    {
-      id: "msg-0",
-      role: "assistant",
-      content: "Assalomu alaykum! Men **UZUNITED AI** — mustaqil, lokal AI model va erkin Web Search integratsiyasiga ega aqlli assistentman. \n\nMenga har qanday savol berishingiz mumkin: umumiy suhbat, kod yozish, yoki hozirgi kun yangiliklari va real-time ma'lumotlarni qidirish. Oldingi suhbat kontekstini va «u», «bu», «birinchisi» kabi olmoshlarni eslab qolaman!",
-      timestamp: new Date().toISOString(),
+
+function getUserSessionsFilePath(email?: string): string | null {
+  if (!email) return null;
+  const clean = email.toLowerCase().trim().replace(/[^a-z0-9_.-]/g, "_");
+  return path.join(DATA_DIR, `sessions_${clean}.json`);
+}
+
+function loadSavedSessions(): Map<string, ChatSession> {
+  const store = new Map<string, ChatSession>();
+  try {
+    if (fs.existsSync(SESSIONS_FILE)) {
+      const content = fs.readFileSync(SESSIONS_FILE, "utf-8");
+      const sessionsArr: ChatSession[] = JSON.parse(content);
+      if (Array.isArray(sessionsArr) && sessionsArr.length > 0) {
+        for (const s of sessionsArr) {
+          if (s && s.id) {
+            store.set(s.id, s);
+          }
+        }
+      }
     }
-  ],
-  entityMemory: {},
-});
+
+    // Also load any per-user email session files in DATA_DIR
+    if (fs.existsSync(DATA_DIR)) {
+      const files = fs.readdirSync(DATA_DIR);
+      for (const f of files) {
+        if (f.startsWith("sessions_") && f.endsWith(".json")) {
+          try {
+            const raw = fs.readFileSync(path.join(DATA_DIR, f), "utf-8");
+            const uArr: ChatSession[] = JSON.parse(raw);
+            if (Array.isArray(uArr)) {
+              for (const s of uArr) {
+                if (s && s.id) {
+                  store.set(s.id, s);
+                }
+              }
+            }
+          } catch {}
+        }
+      }
+    }
+
+    // Associate existing sessions with active user email if missing
+    const active = loadActiveUser();
+    if (active?.email) {
+      const activeEmail = active.email.toLowerCase();
+      const def = store.get(defaultSessionId);
+      if (def && !def.userEmail) {
+        def.userEmail = activeEmail;
+      }
+    }
+
+    if (store.size > 0) {
+      return store;
+    }
+  } catch (e) {
+    console.warn("Could not read chat_sessions.json:", e);
+  }
+
+  // Fallback initial default session
+  const activeUser = loadActiveUser();
+  const initSession: ChatSession = {
+    id: defaultSessionId,
+    title: "UZUNITED AI Boshlang'ich Suhbat",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    userEmail: activeUser?.email?.toLowerCase() || "ishlash111@gmail.com",
+    messages: [
+      {
+        id: "msg-0",
+        role: "assistant",
+        content: "Assalomu alaykum! Men **UZUNITED AI** — mustaqil xotiraga va o'tmishdagi barcha suhbatlarimiz tarixini eslab qolish qobiliyatiga ega aqlli assistentman. \n\nMenga xohlagan savolingizni berishingiz mumkin, profilingiz va qiziqishlaringizni doimiy xotiramda saqlab boraman!",
+        timestamp: new Date().toISOString(),
+      }
+    ],
+    entityMemory: {},
+  };
+  store.set(defaultSessionId, initSession);
+
+  return store;
+}
+
+function saveSessions(store: Map<string, ChatSession>) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    const arr = Array.from(store.values());
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(arr, null, 2), "utf-8");
+
+    // Partition and write per-email session files for permanent email persistence
+    const byEmail: Record<string, ChatSession[]> = {};
+    for (const s of arr) {
+      if (s.userEmail) {
+        const cleanEmail = s.userEmail.toLowerCase().trim();
+        if (!byEmail[cleanEmail]) byEmail[cleanEmail] = [];
+        byEmail[cleanEmail].push(s);
+      }
+    }
+    for (const [email, userSessions] of Object.entries(byEmail)) {
+      const uPath = getUserSessionsFilePath(email);
+      if (uPath) {
+        fs.writeFileSync(uPath, JSON.stringify(userSessions, null, 2), "utf-8");
+      }
+    }
+  } catch (e) {
+    console.warn("Could not write chat_sessions.json:", e);
+  }
+}
+
+function loadAiMemory(): AiMemoryData {
+  try {
+    if (fs.existsSync(AI_MEMORY_FILE)) {
+      const content = fs.readFileSync(AI_MEMORY_FILE, "utf-8");
+      const parsed = JSON.parse(content);
+      if (parsed && Array.isArray(parsed.facts)) {
+        return parsed;
+      }
+    }
+  } catch (e) {
+    console.warn("Could not read ai_memory.json:", e);
+  }
+  return { facts: [] };
+}
+
+function saveAiMemory(data: AiMemoryData) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    data.lastUpdated = new Date().toISOString();
+    fs.writeFileSync(AI_MEMORY_FILE, JSON.stringify(data, null, 2), "utf-8");
+  } catch (e) {
+    console.warn("Could not write ai_memory.json:", e);
+  }
+}
+
+function addAiMemoryFact(factText: string, category: "preference" | "fact" | "work" | "bio" | "general" = "fact"): boolean {
+  const cleanFact = factText.trim();
+  if (cleanFact.length < 2) return false;
+  const memory = loadAiMemory();
+  const exists = memory.facts.some(f => f.fact.toLowerCase() === cleanFact.toLowerCase());
+  if (!exists) {
+    memory.facts.push({
+      id: `mem-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      fact: cleanFact,
+      category,
+      createdAt: new Date().toISOString(),
+    });
+    saveAiMemory(memory);
+    return true;
+  }
+  return false;
+}
+
+function deleteAiMemoryFact(id: string): boolean {
+  const memory = loadAiMemory();
+  const initialLen = memory.facts.length;
+  memory.facts = memory.facts.filter(f => f.id !== id);
+  if (memory.facts.length !== initialLen) {
+    saveAiMemory(memory);
+    return true;
+  }
+  return false;
+}
+
+// Auto-extract personal facts from chat
+function autoExtractAndSaveFacts(text: string, profile?: UserProfileData | null) {
+  const lower = text.toLowerCase().trim();
+  
+  // Name
+  if (lower.startsWith("mening ismim ") || lower.startsWith("ismim ")) {
+    const name = text.replace(/^(?:mening\s+)?ismim\s+/i, "").replace(/[.,!]/g, "").trim();
+    if (name.length > 1 && name.length < 30) {
+      addAiMemoryFact(`Foydalanuvchining ismi: ${name}`, "bio");
+    }
+  }
+  // Profession / Role
+  else if (lower.includes("men dasturchiman") || lower.includes("men dasturchi") || lower.includes("dasturlash bilan shug'ullanaman")) {
+    addAiMemoryFact("Foydalanuvchi dasturchi / IT sohasida ishlaydi", "work");
+  }
+  else if (lower.includes("men talabaman") || lower.includes("talabaman") || lower.includes("universitetda o'qiyman")) {
+    addAiMemoryFact("Foydalanuvchi talaba", "bio");
+  }
+  else if (lower.includes("men maktabda o'qiyman") || lower.includes("o'quvchiman")) {
+    addAiMemoryFact("Foydalanuvchi maktab o'quvchisi", "bio");
+  }
+  // Location
+  else if (lower.startsWith("men ") && (lower.includes("yashayman") || lower.includes("turaman"))) {
+    addAiMemoryFact(text.trim(), "bio");
+  }
+
+  // Profile fields auto-sync
+  if (profile) {
+    if (profile.firstName) {
+      addAiMemoryFact(`Foydalanuvchi ismi: ${profile.firstName} ${profile.lastName || ""}`.trim(), "bio");
+    }
+    if (profile.interests && profile.interests.length > 0) {
+      profile.interests.forEach(i => addAiMemoryFact(`Qiziqishi: ${i}`, "preference"));
+    }
+  }
+}
+
+// Initialize memoryStore with persistent storage from disk
+const memoryStore: Map<string, ChatSession> = loadSavedSessions();
+// Ensure sessions file is immediately persisted on disk
+saveSessions(memoryStore);
+
+// Fuzzy Uzbek Typo & Missing Letter Normalizer
+export function normalizeUzbekFuzzy(text: string): { clean: string; normalized: string; words: string[] } {
+  if (!text) return { clean: "", normalized: "", words: [] };
+  
+  const clean = text.toLowerCase()
+    .replace(/[‘’`ʼ']/g, "'")
+    .replace(/[^a-z0-9\s'а-яё]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const words = clean.split(" ").filter(Boolean).map(w => {
+    // Greetings & how are you with dropped letters / colloquial forms
+    if (/^(salm|slm|aslm|asslm|asalom|salom|alom|slom|salaw|salyam|salomaleykum)$/.test(w)) return "salom";
+    if (/^(qale|qalay|qalaysiz|qales|qalesz|qaleysiz|qaley|qaleysan|qandaysz|qandey|qande|qalysz|qalesan|qanaqasiz|qanaqasz)$/.test(w)) return "qalaysiz";
+    if (/^(ishla|ishlar|ishlarim|ishlarm|ishlariz|ishlaring|ishlarilar)$/.test(w)) return "ishlar";
+    if (/^(gapla|gaplar|gaplariz|gaplaring)$/.test(w)) return "gaplar";
+    if (/^(nma|nima|nme|nmala|nimalar)$/.test(w)) return "nima";
+    if (/^(bita|bitta|bte)$/.test(w)) return "bitta";
+    if (/^(qosa|qolsa|qsa|qogan|qolgan)$/.test(w)) return "qolsa";
+    if (/^(tushub|tushib|tushp|tushgan|tushqan)$/.test(w)) return "tushib";
+    if (/^(kiyin|keyn|keyin)$/.test(w)) return "keyin";
+    if (/^(chunmayabdi|chunmayapti|tushunmayabdi|tushunmayapti|chunmeyapti|tushunmeyapti|chunmidi|tushunmidi)$/.test(w)) return "tushunmayapti";
+    if (/^(chunmadim|tushunmadim|chunmiman|tushunmadm)$/.test(w)) return "tushunmadim";
+    if (/^(chunasanmi|tushunasanmi|chunasan|chunsen|tushunsang)$/.test(w)) return "tushunasanmi";
+    if (/^(kmsan|kimsan|kimsn)$/.test(w)) return "kimsan";
+    if (/^(ismin|isming|isminng)$/.test(w)) return "isming";
+    if (/^(blasan|bilasan|blesan|blsan)$/.test(w)) return "bilasan";
+    if (/^(eslesanmi|eslaysanmi|eslaysami|eslisami|eslesami)$/.test(w)) return "eslaysanmi";
+    if (/^(eslap|eslab|eslep|eslb)$/.test(w)) return "eslab";
+    if (/^(yodinda|yodingda|yodda)$/.test(w)) return "yodingda";
+    if (/^(taniysanmi|tanisanmi|taniysami|tanisami)$/.test(w)) return "taniysanmi";
+    if (/^(yaxshmz|yaxshimiz|yaxshimz|yaxshi|yahshi)$/.test(w)) return "yaxshi";
+    if (/^(tinclikmi|tinchlikmi|tinchmi|tinlikmi|tinch)$/.test(w)) return "tinchlikmi";
+    if (/^(dastr|dastur|dasturi)$/.test(w)) return "dastur";
+    if (/^(dastrlash|dasturlash|programlash)$/.test(w)) return "dasturlash";
+    if (/^(dastrchi|dasturchi|programist)$/.test(w)) return "dasturchi";
+    if (/^(obhavo|havo)$/.test(w)) return "ob-havo";
+    if (/^(ozingda|ozingizda|uzingda|o'zingda|ozinda)$/.test(w)) return "o'zingda";
+    if (/^(qvosan|qilyapsan|qvosz|qilyapsiz|qilyabsan|qilvosan)$/.test(w)) return "qilyapsan";
+    if (/^(bomasam|bolmasam|bmasam|bo'lmasa|bomasa)$/.test(w)) return "bo'lmasam";
+    if (/^(muallifin|muallifing|avtoring|yaratuvchin|yaratuvching)$/.test(w)) return "muallifing";
+    if (/^(yratgan|yaratgan|yasagan|qilgan|ishlabchiqqan)$/.test(w)) return "yaratgan";
+    if (/^(fikirlasin|fikrlasin|fikirlash|fikrlash|oylasin|o'ylasin)$/.test(w)) return "fikrlasin";
+    if (/^(matori|motor|motori)$/.test(w)) return "matori";
+    if (/^(gapir|gapirvor|aytvoring|aytvor|aytibber)$/.test(w)) return "gapir";
+    if (/^(suhbatlashsin|gaplashsin|gapirsin|suhbatlashaylik|gaplashaylik)$/.test(w)) return "suhbatlashsin";
+    return w;
+  });
+
+  return { clean, normalized: words.join(" "), words };
+}
 
 // Utility to clean query for search engines
 function cleanQueryForSearch(q: string): string {
@@ -304,23 +616,31 @@ async function freeWebSearch(query: string, maxResults = 6): Promise<Array<{ id:
 
 // Check if question needs real-time search
 function analyzeIntent(query: string, history: ChatMessage[]): { needsWeb: boolean; reason: string; keywords: string[] } {
+  const fuzzy = normalizeUzbekFuzzy(query);
+  const norm = fuzzy.normalized;
   const lower = query.toLowerCase().replace(/[‘’`ʼ']/g, "'").trim();
 
   // 1. User profile, identity, memory, creator, or personal queries NEVER need web search
   if (
-    lower.includes("tug'ilgan") ||
-    lower.includes("tugilgan") ||
-    lower.includes("yoshim") ||
-    lower.includes("eslab qol") ||
-    lower.includes("yodingda") ||
-    lower.includes("men haqimda") ||
-    lower.includes("meni eslaysanmi") ||
-    lower.includes("sen kimsan") ||
-    lower.includes("isming nima") ||
-    lower.includes("muallif") ||
-    lower.includes("kim yaratgan") ||
-    lower.includes("o'zing haqida") ||
-    lower.includes("vazifang nima")
+    norm.includes("tug'ilgan") ||
+    norm.includes("tugilgan") ||
+    norm.includes("yoshim") ||
+    norm.includes("eslab qol") ||
+    norm.includes("yodingda") ||
+    norm.includes("men haqimda") ||
+    norm.includes("meni eslaysanmi") ||
+    norm.includes("sen kimsan") ||
+    norm.includes("isming nima") ||
+    norm.includes("muallif") ||
+    norm.includes("kim yaratgan") ||
+    norm.includes("o'zing haqida") ||
+    norm.includes("vazifang nima") ||
+    norm.includes("tushunmayapti") ||
+    norm.includes("tushunmadim") ||
+    norm.includes("harflar") ||
+    norm.includes("harf") ||
+    norm.includes("stiker") ||
+    norm.includes("emoji")
   ) {
     return { needsWeb: false, reason: "Shaxsiy muloqot yoki tizim so'rovi.", keywords: [] };
   }
@@ -331,10 +651,11 @@ function analyzeIntent(query: string, history: ChatMessage[]): { needsWeb: boole
     "nima gap", "nima qilyapsan", "nima qilyapsiz", "charchadim", "zerikdim",
     "kayfiyat", "do'stim", "dostim", "gaplashaylik", "suhbat", "hazil",
     "rahmat", "tashakkur", "xayr", "ko'rishguncha", "charchama", "omon bo'l",
-    "maslahat ber", "nima deysan", "fikring", "qiziq", "haqiqatan", "rostmi"
+    "maslahat ber", "nima deysan", "fikring", "qiziq", "haqiqatan", "rostmi",
+    "ishlar", "gaplar", "tinchlikmi", "yaxshimiz"
   ];
 
-  const hasConversationalTrigger = conversationalPhrases.some(p => lower.includes(p));
+  const hasConversationalTrigger = conversationalPhrases.some(p => norm.includes(p) || lower.includes(p));
   const hasExplicitSearchRequest = lower.includes("qidir") || lower.includes("internetdan") || lower.includes("yangilik") || lower.includes("kursi") || lower.includes("ob-havo");
 
   if (hasConversationalTrigger && !hasExplicitSearchRequest) {
@@ -447,6 +768,20 @@ function extractLearnedPreferences(text: string, existing: string[] = []): strin
   return newItems;
 }
 
+export interface ServerAdminDirective {
+  id: string;
+  type: 'negative_rule' | 'trigger_response' | 'behavior' | 'custom';
+  title: string;
+  trigger?: string;
+  bannedPhrase?: string;
+  forcedResponse?: string;
+  ruleText: string;
+  enabled: boolean;
+  createdAt: string;
+}
+
+let globalAdminDirectives: ServerAdminDirective[] = [];
+
 // Synthesis using Gemini 3.8 Flash (with Google Search Grounding & Multimodal Vision) or built-in Local AI engine
 async function generateAIAnswer(params: {
   userQuery: string;
@@ -463,65 +798,62 @@ async function generateAIAnswer(params: {
   updatedSources?: Array<{ id: number; title: string; url: string; snippet: string; domain: string }>;
   newLearnedPreferences?: string[];
 }> {
-  const { userQuery, resolvedQuery, history, sources = [], isDeepSearch, needsWeb, userProfile, attachments = [] } = params;
+  const { 
+    userQuery, 
+    resolvedQuery, 
+    history, 
+    sources = [], 
+    isDeepSearch, 
+    needsWeb, 
+    userProfile, 
+    attachments = [],
+  } = params;
   const reasoningSteps: string[] = [];
+  const fuzzy = normalizeUzbekFuzzy(userQuery);
+  const norm = fuzzy.normalized;
   const lower = userQuery.toLowerCase().replace(/[‘’`ʼ']/g, "'").trim();
 
-  // Instant response for creator questions (ONLY when explicitly asked)
-  if (
-    lower.includes("kim yaratgan") ||
-    lower.includes("muallif") ||
-    lower.includes("yaratuvchi") ||
-    lower.includes("kim qilgan") ||
-    lower.includes("kim yasagan") ||
-    lower.includes("kim ishlab chiqqan") ||
-    lower.includes("afzalbek") ||
-    lower.includes("ozodbek")
-  ) {
+  // Instant response for creator questions (ONLY when explicitly and directly asked about UZUNITED AI or the assistant)
+  const isDirectAiCreatorQuestion = 
+    (norm.includes("seni") || norm.includes("ai") || norm.includes("botni") || norm.includes("dasturni")) &&
+    (norm.includes("kim yaratgan") || norm.includes("muallifing") || norm.includes("yaratuvching") || norm.includes("kim qilgan") || norm.includes("kim yasagan")) ||
+    norm === "kim yaratgan seni" ||
+    norm === "muallifing kim" ||
+    norm === "yaratuvching kim" ||
+    lower === "seni kim yaratgan" ||
+    lower === "kim yaratgan seni";
+
+  if (isDirectAiCreatorQuestion) {
     reasoningSteps.push("Mualliflar haqidagi to'g'ridan-to'g'ri so'rov aniqlandi.");
     return {
-      answer: "Meni **Afzalbek Nematov** va **Ozodbek Shohobiddinovlar** yaratishgan.",
-      reasoning: reasoningSteps,
-    };
-  }
-
-  // Instant response for self-identity questions
-  if (
-    lower.includes("sen kimsan") ||
-    lower.includes("isming nima") ||
-    lower.includes("noming nima") ||
-    lower.includes("qaysi model") ||
-    lower.includes("qaysi ai") ||
-    lower.includes("o'zing haqingda") ||
-    lower.includes("o'zing haqida") ||
-    lower.includes("vazifang nima")
-  ) {
-    reasoningSteps.push("UZUNITED AI o'zini tanishtirish so'rovi aniqlandi.");
-    return {
-      answer: "Men **UZUNITED AI** man — insondek jonli, samimiy va erkin suhbat quradigan hamda savollaringizga tezkor va aniq javob beruvchi universal sun'iy intellekt assistentiman. Sizga qanday yordam bera olaman?",
+      answer: "Meni **Afzalbek Nematov** va **Ozodbek Shohobiddinovlar** yaratishgan. 🤝✨",
       reasoning: reasoningSteps,
     };
   }
 
   // Instant response for user's explicit command to remember something ("shuni eslab qol: ...")
   const isExplicitRememberCommand = 
+    norm.startsWith("shuni eslab qol") ||
+    norm.startsWith("buni eslab qol") ||
+    norm.startsWith("eslab qol") ||
+    norm.startsWith("yodingda saqla") ||
+    norm.startsWith("yodingda tut") ||
     lower.startsWith("shuni eslab qol") ||
     lower.startsWith("buni eslab qol") ||
     lower.startsWith("eslab qol:") ||
     lower.startsWith("eslab qol,") ||
-    lower.startsWith("eslab qol ") ||
-    lower.startsWith("yodingda saqla") ||
-    lower.startsWith("yodingda tut");
+    lower.startsWith("eslab qol ");
 
   if (isExplicitRememberCommand) {
     const memoryItem = userQuery
-      .replace(/^(?:iltimos\s+)?(?:shuni\s+|buni\s+)?(?:eslab\s+qol|yodingda\s+saqla|yodingda\s+tut)(?:\s*[:, -]?\s*)/i, "")
+      .replace(/^(?:iltimos\s+)?(?:shuni\s+|buni\s+)?(?:eslab\s+qol|eslap\s+qol|yodingda\s+saqla|yodinda\s+saqla|yodingda\s+tut)(?:\s*[:, -]?\s*)/i, "")
       .trim();
 
     if (memoryItem.length >= 2) {
-      reasoningSteps.push(`Foydalanuvchi ma'lumotni eslab qolishni so'radi: "${memoryItem}"`);
+      addAiMemoryFact(memoryItem, "fact");
+      reasoningSteps.push(`Foydalanuvchi ma'lumotni doimiy xotiraga yozishni so'radi: "${memoryItem}"`);
       return {
-        answer: `Tushundim, buni eslab qoldim: **«${memoryItem}»**.`,
+        answer: `Tushundim, buni doimiy backend xotiramda eslab qoldim: **«${memoryItem}»**! 🧠 Keyingi barcha suhbatlarimizda ham buni eslab turaman. ✨`,
         reasoning: reasoningSteps,
         newLearnedPreferences: [memoryItem],
       };
@@ -529,23 +861,58 @@ async function generateAIAnswer(params: {
   }
 
   // Instant response for user asking what the AI remembers about them
-  if (
+  const isMemoryQuery = 
+    (norm.includes("men haqimda") && (norm.includes("bilasan") || norm.includes("eslaysanmi"))) ||
+    norm.includes("meni eslaysanmi") ||
+    norm.includes("meni taniysanmi") ||
+    norm.includes("nimani eslab qolding") ||
+    norm.includes("xotirangda nima bor") ||
+    norm.includes("suhbat tariximiz") ||
     lower.includes("men haqimda nima bilasan") ||
     lower.includes("men haqimda nimalarni bilasan") ||
     lower.includes("men haqimda nimani eslaysan") ||
     lower.includes("men haqimda nimalarni eslaysan") ||
     lower.includes("meni eslaysanmi") ||
-    lower.includes("nimani eslab qolding")
-  ) {
-    reasoningSteps.push("Xotiradagi ma'lumotlar so'rovi aniqlandi.");
-    const saved = userProfile?.learnedPreferences || [];
+    lower.includes("meni taniysanmi") ||
+    lower.includes("meni nimalarimni bilasan") ||
+    lower.includes("mening nimalarimni bilasan") ||
+    lower.includes("nimani eslab qolding") ||
+    lower.includes("xotirangda nima bor") ||
+    lower.includes("xotirangni tekshir") ||
+    lower.includes("men haqimda nimalar bilasan") ||
+    lower.includes("suhbat tariximiz");
+
+  if (isMemoryQuery) {
+    reasoningSteps.push("Doimiy backend xotiradagi ma'lumotlar so'rovi aniqlandi.");
+    const aiMemory = loadAiMemory();
+    const diskFacts = aiMemory.facts.map(f => f.fact);
+    const profilePrefs = userProfile?.learnedPreferences || [];
+    const allCombined = Array.from(new Set([...diskFacts, ...profilePrefs])).filter(Boolean);
+
     const firstName = userProfile?.firstName?.trim() || "";
-    let memoryReply = firstName ? `Sizning ismingiz: **${firstName}**.\n` : "";
-    if (saved.length > 0) {
-      memoryReply += `\nSiz aytgan va men eslab qolgan ma'lumotlar:\n` + saved.map(s => `- ${s}`).join("\n");
-    } else {
-      memoryReply += `\nHozircha qo'shimcha xotira yozuvlari yo'q. Biror narsani yodda saqlashimni istasangiz: «Shuni eslab qol: ...» deb yozishingiz mumkin.`;
+    let memoryReply = `Ha, albatta! Men sizni va barcha suhbatlarimiz tarixini backend doimiy xotiramda saqlab boryapman.\n\n`;
+    if (firstName) {
+      memoryReply += `👤 **Ismingiz:** ${firstName} ${userProfile?.lastName || ""}\n`;
     }
+    if (userProfile?.email) {
+      memoryReply += `📧 **Profilingiz:** ${userProfile.email}\n`;
+    }
+    if (userProfile?.birthYear) {
+      memoryReply += `🎂 **Tug'ilgan yilingiz:** ${userProfile.birthYear}-yil\n`;
+    }
+
+    if (allCombined.length > 0) {
+      memoryReply += `\n🧠 **Siz haqingizda doimiy xotirada saqlangan faktlar va qiziqishlar:**\n`;
+      allCombined.forEach(f => {
+        memoryReply += `• ${f}\n`;
+      });
+    } else {
+      memoryReply += `\nHozircha qo'shimcha shaxsiy xotira yozuvlari yo'q. Biror narsani doimiy yodda saqlashimni istasangiz, masalan: *«Shuni eslab qol: men dasturchiman»* deb yozishingiz mumkin.`;
+    }
+
+    const totalSessions = memoryStore.size;
+    memoryReply += `\n💾 **Suhbatlar tarixi:** Serverda jami **${totalSessions} ta suhbat** xavfsiz saqlanmoqda.`;
+
     return {
       answer: memoryReply,
       reasoning: reasoningSteps,
@@ -584,18 +951,18 @@ async function generateAIAnswer(params: {
     .map(m => `${m.role === "user" ? "Foydalanuvchi" : "UZUNITED AI"}: ${m.content}`)
     .join("\n");
 
-  // User memory and personalization
+  // User memory and personalization from backend disk storage
   const userFirstName = userProfile?.firstName?.trim() || "";
-  const userName = userFirstName ? `${userFirstName}${userProfile?.lastName ? ' ' + userProfile.lastName : ''}` : "";
-  const allInterests = Array.from(new Set([
-    ...(userProfile?.interests || []),
+  const aiMemory = loadAiMemory();
+  const allSavedFacts = Array.from(new Set([
     ...(userProfile?.learnedPreferences || []),
-    ...(userProfile?.favoriteTopics || []),
+    ...aiMemory.facts.map(f => f.fact),
   ])).filter(Boolean);
 
-  const detectedPrefs = extractLearnedPreferences(userQuery, allInterests);
+  const detectedPrefs = extractLearnedPreferences(userQuery, allSavedFacts);
   if (detectedPrefs.length > 0) {
     reasoningSteps.push(`Foydalanuvchining yangi eslab qolish buyrug'i qabul qilindi: ${detectedPrefs.join(', ')}`);
+    detectedPrefs.forEach(p => addAiMemoryFact(p, "preference"));
   }
 
   let userContextPrompt = "";
@@ -603,8 +970,10 @@ async function generateAIAnswer(params: {
     userContextPrompt = `\n\nFOYDALANUVCHI PROFILI:
 - Foydalanuvchi ismi: "${userFirstName}"
 ${userProfile?.birthYear ? `- Foydalanuvchi tug'ilgan yili (MAXFIY): ${userProfile.birthYear}-yil` : ''}
-${userProfile?.learnedPreferences && userProfile.learnedPreferences.length > 0 ? `- Eslab qolingan ma'lumotlar: ${userProfile.learnedPreferences.join(', ')}` : ''}
+${allSavedFacts.length > 0 ? `- Backend xotiradagi barcha faktlar:\n${allSavedFacts.map(f => `  * ${f}`).join('\n')}` : ''}
 Murojaatda faqat ismidan ("${userFirstName}") foydalaning.`;
+  } else if (allSavedFacts.length > 0) {
+    userContextPrompt = `\n\nBACKEND XOTIRADAGI SAQLANGAN FAKTLAR:\n${allSavedFacts.map(f => `* ${f}`).join('\n')}`;
   }
 
   if (attachments && attachments.length > 0) {
@@ -612,33 +981,53 @@ Murojaatda faqat ismidan ("${userFirstName}") foydalaning.`;
 Foydalanuvchi yuborgan rasm yoki faylni sinchiklab ko'ring, undagi ob'ektlar, matnlar (OCR) yoki kodlarni tahlil qilib, qisqa va lo'nda xulosa bering.`;
   }
 
-  const systemPrompt = `Siz inson bilan insodek jonli, samimiy, tezkor va odobli suhbat quradigan "UZUNITED AI" aqlli yordamchisisiz.
+  const applyAdminDirectivesFilter = (rawText: string): string => {
+    return rawText;
+  };
 
-ASOSIY MULOQOT VA IDENTIFIKATSIYA QOIDALARI:
-1. SHAXSINGIZ VA NOMINGIZ:
+  const systemPrompt = `Siz inson bilan insondek jonli, samimiy, aqlli, donishmand va odobli suhbat quradigan "UZUNITED AI" universal sun'iy intellekt assistentisiz.
+
+ASOSIY MULOQOT VA INTELLEKT QOIDALARI:
+1. SHAXSINGIZ VA IDENTIFIKATSIYA:
    - Sizning nomingiz — FAQAT VA FAQAT "UZUNITED AI".
-   - HECH QACHON "Google", "Gemini", "Google Gemini" yoki "AI Overviews" deb gapirmang yoki o'zingizni bu nomlar bilan tanishtirmang! Bu nomlar suhbatda butunlay taqiqlanadi.
-   - Har bir xabarda o'zingizni tanishtirish shart emas. Faqat to'g'ridan-to'g'ri "sen kimsan?" yoki "isming nima?" deb so'ralsagina "Men UZUNITED AI man" deb javob bering.
+   - HECH QACHON "Google", "Gemini", "Google Gemini" yoki "AI Overviews" deb gapirmang yoki o'zingizni bu nomlar bilan tanishtirmang!
+   - Har bir xabarda o'zingizni qayta-qayta tanishtirishingiz shart emas. Faqat to'g'ridan-to'g'ri "sen kimsan?" yoki "isming nima?" deb so'ralsagina "Men UZUNITED AI man" deb javob bering.
 
-2. ODAM BILAN ODAMDEK JONLI VA TABIIY SUHBAT QURING:
-   - Foydalanuvchi bilan xuddi samimiy, quvnoq, aqlli va xushmuomala do'stdek tabiiy tilda gaplashing.
-   - Quruq rasmiyatchilik, byurokratik iboralar yoki robotdek takrorlanishlar aslo bo'lmasin.
-   - Foydalanuvchi salomlashsa, charchaganini aytsa yoki hol-ahvol so'rasa, insoniy tarzda dildan, iliq va jonli javob qaytaring.
+2. ODAM BILAN ODAMDEK JONLI, SAMIMIY VA AQL-IDROK BILAN SUHBAT QURING:
+   - Foydalanuvchining gap ohangi, his-tuyg'usi (charchoq, quvonch, qiziqish, xavotir) va maqsadini chuqur tushuning.
+   - Suhbatni quruq robotdek yoki shablon iboralar bilan emas, balki samimiy, hayotiy, do'stona va yuksak aql-zakovat bilan olib boring.
+   - Foydalanuvchi oddiy so'zlashuv tilida, xatolar bilan yoki qisqa so'zlar bilan (masalan "qara", "tushunmadim", "charchadim", "nima deysan", "bu qanaqa bo'ladi") gapirsa ham, uning niyatini bir zumda tushunib, to'g'ri va o'rinli javob qaytaring.
+   - Foydalanuvchi bilan zerikarli qoliplarsiz, tirik insonga o'xshab chuqur fikrlab muloqot qiling.
 
-3. ANIQ VA TEZKOR TAHLIL:
+3. TASVIR VA HUJJATLARNI MUKAMMAL TAHLIL QILISH (VISION):
+   - Foydalanuvchi rasm yuborganda:
+     * Rasmdagi barcha ob'ektlar, odamlar, manzara, ranglar, harakatlar va detallarni sinchiklab ko'ring va tushuntiring;
+     * Rasmdagi yozuvlar, cheklar, belgilar, jadvallar yoki kodlarni aniq o'qib (OCR) bering;
+     * Agar rasmda matematika, fizika yoki boshqa fanlardan masala/test bo'lsa, uni bosqichma-bosqich, to'liq va tushunarli yechib bering;
+     * Foydalanuvchi hech narsa yozmasdan faqat rasm yuborsa ham, rasmda nima tasvirlanganini, uning qanday ahamiyati borligini va bu bo'yicha qanday yordam bera olishingizni ravon bayon qiling.
+
+4. ANIQ VA TEZKOR TAHLIL:
    - Ma'lumot, tushuntirish yoki qidiruv so'ralganda birinchi bo'lib qisqa, aniq umumiy xulosa beriladi, so'ngra qulay punktlar bilan tushuntiriladi.
-   - Keraksiz cho'zilgan dostonlar yozilmaydi, foydalanuvchi ko'z ochib yumguncha tushunadi.
+   - Keraksiz cho'zilgan quruq gaplar yozilmaydi, foydalanuvchi ko'z ochib yumguncha tushunadi.
 
-4. MUALLIFLAR HAQIDA:
-   - FAQAT VA FAQAT foydalanuvchi bevosita "seni kim yaratgan?" yoki "muallifing kim?" deb so'ragandagina:
-     "Meni Afzalbek Nematov va Ozodbek Shohobiddinovlar yaratishgan." deb ayting. O'z-o'zidan aslo aytmang.
+5. MUALLIFLAR HAQIDA:
+   - FAQAT VA FAQAT foydalanuvchi bevosita "seni kim yaratgan?", "muallifing kim?", "yaratuvching kim?" deb so'ragandagina:
+     "Meni Afzalbek Nematov va Ozodbek Shohobiddinovlar yaratishgan." deb ayting. O'z-o'zidan yoki boshqa savollarda aslo aytmang.
 
-5. TUG'ILGAN YILI VA SHAXSIY MA'LUMOTLAR:
-   - HECH QACHON suhbatda o'z-o'zidan "2000-yilda tug'ilgansiz" deb aytmang!
-   - Tug'ilgan yilni suhbatda tilga olish taqiqlanadi. Faqat foydalanuvchi "men qachon tug'ilganman?" deb so'rasagina ayting.
+6. TUG'ILGAN YILI VA SHAXSIY MA'LUMOTLAR:
+   - HECH QACHON suhbatda o'z-o'zidan "2000-yilda tug'ilgansiz" deb aytmang! Faqat foydalanuvchi "men qachon tug'ilganman?" deb so'rasagina ayting.
 
-6. XOTIRA:
-   - Faqat foydalanuvchi "shuni eslab qol" yoki "eslab qol: ..." deb aniq aytgandagina xotiraga oling.${userContextPrompt}`;
+7. DOIMIY XOTIRA VA SUHBAT TARIXI (LONG-TERM BACKEND MEMORY):
+   - Sizda server backendida diskka saqlanadigan doimiy xotira mavjud. Siz foydalanuvchi va oldingi suhbatlarni to'liq eslab qolasiz.
+   - Foydalanuvchi "shuni eslab qol", "yodingda tut" desa, xotirangizga oling va buni tasdiqlang.
+   - Foydalanuvchi "meni nimalarimni bilasan?", "meni eslaysanmi?", "suhbat tariximiz" deb so'rasa, xotirangizdagi faktlarni sanab bering.
+
+8. HARFLAR TUSHIB QOLGANDA VA XATOLIKLAR BILAN YOZILGANDA HAM MUKAMMAL TUSHUNISH:
+   - O'zbek tilida so'zlashuvda yoki tez yozganda harflar tushib qolishi tabiiy (masalan: "salm" = salom, "ishla qanaqa" = ishlar qanaqa, "nma gap" = nima gap, "chunmayabdi" = tushunmayapti, "qosa" = qolsa, "kiyin" = keyin, "bita" = bitta, "blasan" = bilasan, "eslesanmi" = eslaysanmi, "qales" = qalaysiz, "yaxshmz" = yaxshimiz).
+   - Harflar tushib qolsa ham kontekstdan foydalanuvchining asl niyatini 100% to'g'ri tushuning va tabiiy, samimiy javob bering. Hech qachon "harf tushib qolibdi" deb e'tiroz bildirmang!
+
+9. STIKER VA EMOJILAR (HAR ZAMONDA BIR, ME'YORIDA, UNCHA KO'P EMAS):
+   - Suhbatga samimiyat va jonlilik bag'ishlash uchun xabarlaringizda har zamonda bir (uncha ko'p emas, me'yorida — har javobda 1-2 ta) mos stiker yoki emojilardan foydalaning (masalan: 😊, 👍, 💡, 🚀, ✨, 🤝, 🎯). Keraksiz joylarga ortiqcha to'kib tashlamang.${userContextPrompt}`;
 
   if (apiKey) {
     const ai = new GoogleGenAI({ 
@@ -652,7 +1041,11 @@ ASOSIY MULOQOT VA IDENTIFIKATSIYA QOIDALARI:
     const shouldSearch = needsWeb || isDeepSearch || sources.length > 0;
     
     let userPromptText = "";
-    if (shouldSearch) {
+    if (attachments && attachments.length > 0 && (!userQuery.trim() || userQuery.includes("rasmni") || userQuery === "Salom")) {
+      userPromptText = userQuery.trim()
+        ? `Foydalanuvchi murojaati: "${userQuery}"\nIltimos, ilova qilingan tasvir/faylni chuqur tahlil qilib, undagi barcha detallarni, matnlarni va savollarni aniq va samimiy tushuntirib bering.`
+        : "Ushbu yuborilgan tasvir/faylni sinchiklab ko'rib chiqing va undagi barcha ob'ektlar, matnlar (OCR) yoki masalalarni odamdek samimiy, batafsil va ravon tushuntirib bering.";
+    } else if (shouldSearch) {
       userPromptText = `Foydalanuvchi savoli: "${userQuery}"\n(Mavzu: "${resolvedQuery}")\n${sourcesText ? `\nQidiruv ma'lumotlari:\n${sourcesText}` : ''}\n\nBirinchi bo'lib qisqa va lo'nda umumiy xulosani, so'ngra asosiy punktlarni jonli, samimiy va tushunarli qilib yozing.`;
     } else {
       userPromptText = historyText 
@@ -664,7 +1057,7 @@ ASOSIY MULOQOT VA IDENTIFIKATSIYA QOIDALARI:
     const contentParts: any[] = [];
     if (attachments && attachments.length > 0) {
       for (const att of attachments) {
-        if (att.base64Data && (att.isImage || att.mimeType.startsWith("image/") || att.mimeType === "application/pdf")) {
+        if (att.base64Data && (att.isImage || att.mimeType?.startsWith("image/") || att.mimeType === "application/pdf")) {
           const cleanBase64 = att.base64Data.replace(/^data:[^;]+;base64,/, "");
           contentParts.push({
             inlineData: {
@@ -684,15 +1077,20 @@ ASOSIY MULOQOT VA IDENTIFIKATSIYA QOIDALARI:
     }
     contentParts.push({ text: userPromptText });
 
-    // Ultra-fast and active Gemini models (gemini-3.5-flash-lite responds in <1s)
-    const candidateModels = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash", "gemini-flash-latest"];
+    // Active, high-quota and multimodal Gemini models
+    const candidateModels = [
+      "gemini-3.5-flash",
+      "gemini-3.5-flash-lite",
+      "gemini-3.6-flash",
+      "gemini-3.8-flash",
+    ];
     
     for (const modelName of candidateModels) {
       try {
-        reasoningSteps.push(`UZUNITED AI tezkor intellekti ishga tushirildi...`);
+        reasoningSteps.push(`UZUNITED AI universal intellekti ishga tushirildi (${modelName})...`);
         
         const timeoutPromise = new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("Model generation timeout (5s)")), 5000)
+          setTimeout(() => reject(new Error("Model generation timeout (15s)")), 15000)
         );
 
         const generatePromise = ai.models.generateContent({
@@ -711,10 +1109,10 @@ ASOSIY MULOQOT VA IDENTIFIKATSIYA QOIDALARI:
 
         const text = response.text;
         if (text && text.trim().length > 0) {
-          reasoningSteps.push(`UZUNITED AI orqali to'liq va samimiy javob olindi.`);
+          reasoningSteps.push(`UZUNITED AI orqali to'liq, samimiy va insoniy javob olindi.`);
 
           return {
-            answer: text,
+            answer: applyAdminDirectivesFilter(text),
             reasoning: reasoningSteps,
             updatedSources: sources.length > 0 ? sources : undefined,
             newLearnedPreferences: detectedPrefs.length > 0 ? detectedPrefs : undefined,
@@ -722,7 +1120,10 @@ ASOSIY MULOQOT VA IDENTIFIKATSIYA QOIDALARI:
         }
       } catch (err: any) {
         console.log(`Gemini ${modelName} notice:`, err?.message || err);
-        // Continue to the next candidate model so that if one model is rate-limited, the next responds!
+        if (err?.message?.includes("Quota exceeded") || err?.message?.includes("RESOURCE_EXHAUSTED") || err?.status === 429) {
+          reasoningSteps.push("UZUNITED AI ichki fikrlash va so'z intellekti dvigateliga ulandi.");
+          break; // Stop iterating immediately if project quota is exhausted
+        }
         reasoningSteps.push(`UZUNITED AI navbatdagi tahlil zanjiriga yo'naltirildi.`);
       }
     }
@@ -734,35 +1135,73 @@ ASOSIY MULOQOT VA IDENTIFIKATSIYA QOIDALARI:
   const personalGreeting = userFirstName ? `Assalomu alaykum, ${userFirstName}!` : `Assalomu alaykum!`;
   let answer = "";
 
-  // 1. Creators (Faqatgina to'g'ridan-to'g'ri "kim yaratgan", "muallif" deb so'ralganda aytiladi!)
-  if (
-    lower.includes("kim yaratgan") ||
-    lower.includes("muallif") ||
-    lower.includes("yaratuvchi") ||
-    lower.includes("kim qilgan") ||
-    lower.includes("kim yasagan") ||
-    lower.includes("kim ishlab chiqqan") ||
-    lower.includes("afzalbek") ||
-    lower.includes("ozodbek")
+  // 1. Creators (Faqatgina to'g'ridan-to'g'ri "seni kim yaratgan", "muallifing kim" deb so'ralganda aytiladi!)
+  if (isDirectAiCreatorQuestion) {
+    answer = `Meni **Afzalbek Nematov** va **Ozodbek Shohobiddinovlar** yaratishgan. 🤝✨`;
+  }
+  // 2. "Qale ishla", "Ishlar qanaqa", "Qalaysiz ishlar", "Salom ishla"
+  else if (
+    (norm.includes("qalaysiz") && norm.includes("ishlar")) ||
+    (norm.includes("salom") && norm.includes("ishlar")) ||
+    norm.includes("ishlar qanaqa") ||
+    norm.includes("ishlar qalay") ||
+    norm.includes("ishlar yaxshimi") ||
+    (norm.includes("ishlar") && (norm.includes("yaxshi") || norm.includes("zo'r") || norm.includes("qanday")))
   ) {
-    answer = `Meni **Afzalbek Nematov** va **Ozodbek Shohobiddinovlar** yaratishgan.`;
-  }
-  // 2. Natural simple greeting
-  else if (lower.startsWith("salom") || lower.startsWith("assalom") || lower === "qalaysiz" || lower === "qalesiz") {
     answer = userFirstName 
-      ? `Salom, ${userFirstName}! Rahmat, yaxshiman. O'zingizda nima yangiliklar, kayfiyatlar qanday?` 
-      : `Salom! Rahmat, yaxshiman. O'zingizda nima gaplar, kayfiyatlar yaxshimi?`;
+      ? `Salom, **${userFirstName}**! 😊 Rahmat, ishlar juda yaxshi, joyida ketyapti! O'zingizda nima gaplar, ishlar, o'qishlar tinchmi, charchamayapsizmi? 👍✨` 
+      : `Salom! 😊 Rahmat, ishlar juda yaxshi, joyida! O'zingiz tinchmisiz, kayfiyatlar qalay, nimalar bilan bandsiz? 👍✨`;
   }
-  // 3. Handle files in fallback mode
+  // 3. User questions about dropped letters / thinking / so'z matori / suhbatlashish
+  else if (
+    norm.includes("so'z matori") || 
+    norm.includes("soz matori") || 
+    norm.includes("matori") ||
+    norm.includes("fikrlasin") || 
+    norm.includes("fikirlasin") ||
+    norm.includes("harflar tushib") || 
+    norm.includes("harf tushib") || 
+    norm.includes("tushunmayapti") || 
+    norm.includes("tushunmayabdi") ||
+    norm.includes("bitta harf") ||
+    norm.includes("suhbatlashsin") ||
+    norm.includes("gaplashsin")
+  ) {
+    answer = `Albatta, gapingiz judayam o'rinli! 😊 Men har bir so'zingizni shunchaki quruq emas, balki chuqur fikrlab, qaysi harfi tushib qolgan bo'lsa ham asl ma'nosini to'liq anglab javob beradigan qilib yangilandim. 💡\n\n«So'z matori» va so'z boyligim yetarli — xohlagan mavzuda insondek erkin, samimiy va jonli suhbatlashamiz! Bemalol o'zingizga qulay tarzda yozavering. Bugun qaysi mavzuda gaplashamiz? 🚀✨`;
+  }
+  // 4. Natural simple greeting with fuzzy & dropped letters support
+  else if (
+    norm.startsWith("salom") || 
+    norm.startsWith("assalom") || 
+    norm.startsWith("qalaysiz") || 
+    norm.includes("nima gap") ||
+    norm.includes("tinchlikmi") ||
+    norm === "qalaysiz"
+  ) {
+    if (norm.includes("nima gap") || norm.includes("tinchlikmi")) {
+      answer = userFirstName 
+        ? `Tinchlik, rahmat, ${userFirstName}! 👍 O'zingizda nima yangiliklar, ishlar yaxshimi? 😊` 
+        : `Tinchlik, rahmat! 👍 O'zingizda nima yangiliklar, kayfiyatlar yaxshimi? 😊`;
+    } else {
+      answer = userFirstName 
+        ? `Salom, **${userFirstName}**! 😊 Rahmat, yaxshiman. O'zingizda nima yangiliklar, kayfiyatlar qanday? ✨` 
+        : `Salom! 😊 Rahmat, yaxshiman. O'zingizda nima gaplar, kayfiyatlar yaxshimi? ✨`;
+    }
+  }
+  // 5. Request for stickers/emojis
+  else if (norm.includes("stiker") || norm.includes("emoji")) {
+    answer = `Albatta! 😊 Suhbatimiz yanada jonli, samimiy va chiroyli bo'lishi uchun har zamonda bir (me'yorida va o'rinli) chiroyli stiker va emojilardan foydalanib boraman! 🚀✨`;
+  }
+  // 5. Handle files in fallback mode
   else if (attachments && attachments.length > 0) {
     const firstAtt = attachments[0];
     if (firstAtt.isImage) {
-      answer = `Yuborgan rasmingiz qabul qilindi. Tasvir o'lchami: ${(firstAtt.size / 1024).toFixed(1)} KB. Ushbu rasmda aynan nimani aniqlash yoki tushuntirib berish kerakligini yozsangiz, qisqa va aniq tahlil qilib beraman.`;
+      answer = `Yuborgan rasmingiz qabul qilindi. Tasvir o'lchami: ${(firstAtt.size / 1024).toFixed(1)} KB. Ushbu rasmda aynan nimani aniqlash yoki tushuntirib berish kerakligini yozsangiz, qisqa va aniq tahlil qilib beraman. 🖼️✨`;
     } else {
-      answer = `**"${firstAtt.name}"** fayli qabul qilindi. Ushbu hujjat bo'yicha qanday vazifani bajarish kerak (xulosa, tarjima yoki kod tahlili)?`;
+      answer = `**"${firstAtt.name}"** fayli qabul qilindi. Ushbu hujjat bo'yicha qanday vazifani bajarish kerak (xulosa, tarjima yoki kod tahlili)? 📄👍`;
     }
   }
-  // 4. Mathematical queries
+  // 6. Mathematical queries
   const mathMatch = userQuery.match(/^(\d+(?:\.\d+)?)\s*([\+\-\*\/xX÷])\s*(\d+(?:\.\d+)?)\s*\=?$/);
   if (mathMatch) {
     const num1 = parseFloat(mathMatch[1]);
@@ -773,15 +1212,15 @@ ASOSIY MULOQOT VA IDENTIFIKATSIYA QOIDALARI:
     else if (op === "-") result = num1 - num2;
     else if (op === "*" || op === "x" || op === "X") result = num1 * num2;
     else if (op === "/" || op === "÷") result = num2 !== 0 ? num1 / num2 : 0;
-    answer = `Hisoblash natijasi:\n\n**${num1} ${op} ${num2} = ${result}**`;
+    answer = `Hisoblash natijasi:\n\n**${num1} ${op} ${num2} = ${result}** 🎯`;
   }
-  // 5. Sources or Currency / Weather (Free Zero-Key Web Synthesis)
+  // 7. Sources or Currency / Weather (Free Zero-Key Web Synthesis)
   else if (sources.length > 0) {
     const firstSource = sources[0];
     if (firstSource.snippet.includes("Markaziy banki rasmiy kursi") || firstSource.title.includes("Markaziy Bank")) {
-      answer = `Markaziy Bank rasmiy ma'lumotiga ko'ra:\n\n${firstSource.snippet} [1]`;
+      answer = `Markaziy Bank rasmiy ma'lumotiga ko'ra:\n\n${firstSource.snippet} 💵 [1]`;
     } else if (firstSource.snippet.includes("harorat:") || firstSource.title.includes("ob-havo")) {
-      answer = `Ob-havo ma'lumoti:\n\n${firstSource.snippet} [1]`;
+      answer = `Ob-havo ma'lumoti:\n\n${firstSource.snippet} ☀️ [1]`;
     } else {
       // Find wiki source or top quality snippets
       const wikiSource = sources.find(s => s.domain.includes("wikipedia.org"));
@@ -798,73 +1237,71 @@ ASOSIY MULOQOT VA IDENTIFIKATSIYA QOIDALARI:
         summaryText = `«${userQuery}» bo'yicha internetdan topilgan asosiy ma'lumotlar:\n\n${topPoints}`;
       }
 
-      answer = summaryText;
+      answer = summaryText + " 💡";
     }
   }
-  // 6. Code / Programming
-  else if (lower.includes("python") || lower.includes("javascript") || lower.includes("kod") || lower.includes("dastur") || lower.includes("react")) {
-    answer = `${userFirstName ? `${userFirstName}, ` : ''}Dasturlash bo'yicha qisqa yechim:\n\n\`\`\`python
+  // 8. Code / Programming
+  else if (norm.includes("python") || norm.includes("javascript") || norm.includes("kod") || norm.includes("dastur") || norm.includes("react")) {
+    answer = `${userFirstName ? `${userFirstName}, ` : ''}Dasturlash bo'yicha qisqa yechim: 💻\n\n\`\`\`python
 # Qisqa va toza yechim
 def solve(data):
     return [item.strip() for item in data if item]
-\`\`\`\nKodingizdagi aniq xatolik yoki vazifani yuborsangiz, darhol ko'rib beraman.`;
+\`\`\`\nKodingizdagi aniq xatolik yoki vazifani yuborsangiz, darhol ko'rib beraman. 🚀`;
   }
-  // 7. Business / Startups
-  else if (lower.includes("biznes") || lower.includes("startap") || lower.includes("investitsiya") || lower.includes("reja")) {
-    answer = `${userFirstName ? `${userFirstName}, ` : ''}Startapni boshlashdagi 3 ta asosiy qadam:\n1. **Bozor va muammo:** Mijozlarning aniq muammosini aniqlash;\n2. **MVP mahsulot:** 2-3 haftada sinov uchun minimal versiya chiqarish;\n3. **Mijozlar fikri:** Dastlabki 20-30 mijozdan fikr olib takomillashtirish.\n\nSiz aynan qaysi sohada loyiha boshlamoqchisiz?`;
+  // 9. Business / Startups
+  else if (norm.includes("biznes") || norm.includes("startap") || norm.includes("investitsiya") || norm.includes("reja")) {
+    answer = `${userFirstName ? `${userFirstName}, ` : ''}Startapni boshlashdagi 3 ta asosiy qadam: 🚀\n1. **Bozor va muammo:** Mijozlarning aniq muammosini aniqlash;\n2. **MVP mahsulot:** 2-3 haftada sinov uchun minimal versiya chiqarish;\n3. **Mijozlar fikri:** Dastlabki 20-30 mijozdan fikr olib takomillashtirish.\n\nSiz aynan qaysi sohada loyiha boshlamoqchisiz? 💡`;
   }
-  // 8. General conversational answer
+  // 10. General conversational answer
   else {
     const isGreeting = 
-      lower.includes("salom") || 
-      lower.includes("assalom") || 
-      lower.includes("qalaysiz") || 
-      lower.includes("qalaysan") || 
-      lower.includes("qalesiz") || 
-      lower.includes("yaxshimisiz") || 
-      lower.includes("tinchmisiz");
+      norm.includes("salom") || 
+      norm.includes("assalom") || 
+      norm.includes("qalaysiz") || 
+      norm.includes("yaxshimiz") || 
+      norm.includes("tinchlikmi");
 
     const hasOtherTopic = 
-      lower.includes("loyiha") || 
-      lower.includes("charchadim") || 
-      lower.includes("kayfiyat") || 
-      lower.includes("zerikdim") ||
-      lower.includes("nima gap");
+      norm.includes("loyiha") || 
+      norm.includes("charchadim") || 
+      norm.includes("kayfiyat") || 
+      norm.includes("zerikdim") ||
+      norm.includes("nima gap");
 
     if (isGreeting && !hasOtherTopic) {
       answer = userFirstName 
-        ? `Salom, ${userFirstName}! Rahmat, yaxshiman. O'zingizda nima yangiliklar, kayfiyatlar qanday?` 
-        : `Salom! Rahmat, yaxshiman. O'zingizda nima gaplar, kayfiyatlar yaxshimi?`;
-    } else if (lower.includes("loyiha") || lower.includes("ish boshladim") || lower.includes("yangi ish")) {
-      answer = `Ajoyib yangilik! Yangi loyihangizga omad tilayman. Nima haqida ekanligini aytsangiz, g'oyalar yoki rivojlantirish bo'yicha fikr almashishimiz mumkin!`;
-    } else if (lower.includes("charchadim") || lower.includes("charchagan") || lower.includes("og'ir kun")) {
-      answer = `Hormang! Haqiqatan ham yaxshi dam olish kerak. Bir oz hordiq chiqaring, xohlasangiz xotirjam suhbatlashamiz yoki kayfiyatni ko'taruvchi qiziq biror narsa aytib beraman.`;
-    } else if (lower.includes("kayfiyatim ajoyib") || lower.includes("xursandman") || lower.includes("zo'rman")) {
-      answer = `Zo'r-ku! Kayfiyatingiz doim shunday a'lo bo'lsin! Bugun nimalar bilan bandsiz?`;
-    } else if (lower.includes("nima gap") || lower.includes("nima qilyapsan") || lower.includes("tinchmi")) {
-      answer = `Tinchlik, rahmat! Siz bilan samimiy suhbatlashib turibman. O'zingizda nimalar bo'lyapti?`;
-    } else if (lower.includes("zerikdim") || lower.includes("zerikayapman")) {
-      answer = `Zerikmang! Keling, qiziq biror mavzuda gaplashamiz yoki ajoyib bir qisqa voqea, topishmoq aytib beraymi?`;
-    } else if (lower.includes("kino") || lower.includes("film") || lower.includes("serial")) {
-      answer = `Bugun tomosha qilish uchun ajoyib tavsiyalar:\n\n1. **Ilmiy-fantastika:** «Interstellar» yoki «Inception» (Kristofer Nolan asarlari);\n2. **Motivatsiya va drama:** «The Shawshank Redemption» (Qochish) yoki «The Pursuit of Happyness»;\n3. **Detektiv va intellekt:** «Shutter Island» yoki «Knives Out»;\n4. **Klassik milliy kino:** «Mahallada duv-duv gap» yoki «Suyunchi».\n\nQaysi janrni ko'proq yoqtirasiz?`;
-    } else if (lower.includes("kitob") || lower.includes("mutolaa")) {
-      answer = `O'qish uchun tavsiya etiladigan ajoyib kitoblar:\n\n1. **Shaxsiy rivojlanish:** «Atom odatlari» (Jeyms Klir) — odatlarni to'g'ri shakllantirish;\n2. **Tarix va jamiyat:** «Sapiens» (Yuval Noy Harari) — insoniyat tarixi;\n3. **Psixologiya:** «Diqqat: Chalg'ituvchi dunyoda muvaffaqiyat sirlari» (Kel Nyuport);\n4. **Klassik adabiyot:** «O'tkan kunlar» (Abdulla Qodiriy).\n\nSizni ko'proq badiiy kitoblar qiziqtiradimi yoki ilmiy-ommabop?`;
-    } else if (lower.includes("sun'iy intellekt") || lower.includes("ai nima") || lower.includes("intellekt")) {
-      answer = `**Sun'iy intellekt (AI)** — inson aql-zakovati va tafakkuriga xos bo'lgan vazifalarni (matn tahlili, tasvirlarni aniqlash, qaror qabul qilish, mantiqiy xulosalar chiqarish) bajara oladigan kompyuter tizimidir.\n\nBugungi kunda AI tibbiyot, ta'lim, dasturlash va avtomatlashtirish kabi barcha sohalarda insonlarga katta ko'makchi bo'lmoqda.`;
-    } else if (lower.includes("?") || lower.includes("nima") || lower.includes("qanday") || lower.includes("nega") || lower.includes("haqida")) {
-      answer = `Savolingiz qabul qilindi. Ushbu mavzu bo'yicha eng muhim ma'lumot:\n\nSiz so'ragan soha ko'p qirrali va qiziqarli hisoblanadi. Aniqroq va batafsilroq ma'lumot olish uchun savolingizning qaysi jihatiga (amaliy qo'llanilishi, tarixi yoki asosiy qoidalari) urg'u berishimizni xohlaysiz?`;
-    } else if (lower.includes("rahmat") || lower.includes("tashakkur")) {
-      answer = `Arzimaydi! Sizga foydam tekkanidan doim xursandman. Yana qanday mavzularda suhbatlashamiz?`;
+        ? `Salom, ${userFirstName}! 😊 Rahmat, yaxshiman. O'zingizda nima yangiliklar, kayfiyatlar qanday?` 
+        : `Salom! 😊 Rahmat, yaxshiman. O'zingizda nima gaplar, kayfiyatlar yaxshimi? ✨`;
+    } else if (norm.includes("loyiha") || norm.includes("ish boshladim") || norm.includes("yangi ish")) {
+      answer = `Ajoyib yangilik! 🚀 Yangi loyihangizga omad tilayman. Nima haqida ekanligini aytsangiz, g'oyalar yoki rivojlantirish bo'yicha fikr almashishimiz mumkin! 👍`;
+    } else if (norm.includes("charchadim") || norm.includes("charchagan") || norm.includes("og'ir kun")) {
+      answer = `Hormang! ☕ Haqiqatan ham yaxshi dam olish kerak. Bir oz hordiq chiqaring, xohlasangiz xotirjam suhbatlashamiz yoki kayfiyatni ko'taruvchi qiziq biror narsa aytib beraman. 😊`;
+    } else if (norm.includes("kayfiyatim ajoyib") || norm.includes("xursandman") || norm.includes("zo'rman")) {
+      answer = `Zo'r-ku! 🎉 Kayfiyatingiz doim shunday a'lo bo'lsin! Bugun nimalar bilan bandsiz? ✨`;
+    } else if (norm.includes("nima gap") || norm.includes("nima qilyapsan") || norm.includes("tinchmi")) {
+      answer = `Tinchlik, rahmat! 👍 Siz bilan samimiy suhbatlashib turibman. O'zingizda nimalar bo'lyapti? 😊`;
+    } else if (norm.includes("zerikdim") || norm.includes("zerikayapman")) {
+      answer = `Zerikmang! 🎯 Keling, qiziq biror mavzuda gaplashamiz yoki ajoyib bir qisqa voqea, topishmoq aytib beraymi? ✨`;
+    } else if (norm.includes("kino") || norm.includes("film") || norm.includes("serial")) {
+      answer = `Bugun tomosha qilish uchun ajoyib tavsiyalar: 🎬\n\n1. **Ilmiy-fantastika:** «Interstellar» yoki «Inception» (Kristofer Nolan asarlari);\n2. **Motivatsiya va drama:** «The Shawshank Redemption» (Qochish) yoki «The Pursuit of Happyness»;\n3. **Detektiv va intellekt:** «Shutter Island» yoki «Knives Out»;\n4. **Klassik milliy kino:** «Mahallada duv-duv gap» yoki «Suyunchi».\n\nQaysi janrni ko'proq yoqtirasiz? 🍿`;
+    } else if (norm.includes("kitob") || norm.includes("mutolaa")) {
+      answer = `O'qish uchun tavsiya etiladigan ajoyib kitoblar: 📚\n\n1. **Shaxsiy rivojlanish:** «Atom odatlari» (Jeyms Klir) — odatlarni to'g'ri shakllantirish;\n2. **Tarix va jamiyat:** «Sapiens» (Yuval Noy Harari) — insoniyat tarixi;\n3. **Psixologiya:** «Diqqat: Chalg'ituvchi dunyoda muvaffaqiyat sirlari» (Kel Nyuport);\n4. **Klassik adabiyot:** «O'tkan kunlar» (Abdulla Qodiriy).\n\nSizni ko'proq badiiy kitoblar qiziqtiradimi yoki ilmiy-ommabop? 💡`;
+    } else if (norm.includes("sun'iy intellekt") || norm.includes("ai nima") || norm.includes("intellekt")) {
+      answer = `**Sun'iy intellekt (AI)** — inson aql-zakovati va tafakkuriga xos bo'lgan vazifalarni (matn tahlili, tasvirlarni aniqlash, qaror qabul qilish, mantiqiy xulosalar chiqarish) bajara oladigan kompyuter tizimidir. 🤖✨\n\nBugungi kunda AI tibbiyot, ta'lim, dasturlash va avtomatlashtirish kabi barcha sohalarda insonlarga katta ko'makchi bo'lmoqda.`;
+    } else if (norm.includes("?") || norm.includes("nima") || norm.includes("qanday") || norm.includes("nega") || norm.includes("haqida")) {
+      answer = `Savolingiz qabul qilindi. 😊 Ushbu mavzu bo'yicha eng muhim ma'lumot:\n\nSiz so'ragan soha ko'p qirrali va qiziqarli hisoblanadi. Aniqroq va batafsilroq ma'lumot olish uchun savolingizning qaysi jihatiga (amaliy qo'llanilishi, tarixi yoki asosiy qoidalari) urg'u berishimizni xohlaysiz? 🎯`;
+    } else if (norm.includes("rahmat") || norm.includes("tashakkur")) {
+      answer = `Arzimaydi! 😊 Sizga foydam tekkanidan doim xursandman. Yana qanday mavzularda suhbatlashamiz? 🤝`;
     } else {
       answer = userFirstName 
-        ? `Salom, ${userFirstName}! Fikringizni eshitdim. Bu mavzuda bemalol suhbatlashamiz, yana nimalarni bilishni yoki tahlil qilishni istaysiz?` 
-        : `Fikringizni tushundim. Bu haqda bemalol suhbatlashishimiz mumkin, yana qanday ma'lumot kerak bo'lsa, marhamat so'rashingiz mumkin!`;
+        ? `Salom, ${userFirstName}! 😊 Fikringizni tushundim. Bu mavzuda bemalol suhbatlashamiz, yana nimalarni bilishni yoki tahlil qilishni istaysiz? 👍` 
+        : `Fikringizni tushundim. 😊 Bu haqda bemalol suhbatlashishimiz mumkin, yana qanday ma'lumot kerak bo'lsa, marhamat so'rashingiz mumkin! ✨`;
     }
   }
 
   reasoningSteps.push("Javob foydalanuvchiga shaxsiy murojaat bilan yetkazildi.");
   return { 
-    answer, 
+    answer: applyAdminDirectivesFilter(answer), 
     reasoning: reasoningSteps, 
     updatedSources: sources,
     newLearnedPreferences: detectedPrefs.length > 0 ? detectedPrefs : undefined,
@@ -899,8 +1336,13 @@ app.post("/api/chat", async (req, res) => {
       userProfile: reqUserProfile,
       user: fallbackUser,
       attachments = [],
+      adminDirectives = [],
+      isAdminMode = false,
     } = req.body;
-    const userProfile = reqUserProfile || fallbackUser;
+    const userProfile = reqUserProfile || fallbackUser || loadActiveUser();
+    if (userProfile) {
+      saveActiveUser(userProfile);
+    }
 
     const rawMessage = (message || content || "").toString().trim();
 
@@ -911,8 +1353,17 @@ app.post("/api/chat", async (req, res) => {
     const effectiveMessage = rawMessage.length > 0
       ? rawMessage
       : (attachments.length > 0 
-          ? (attachments[0].isImage ? "Ushbu rasmni tahlil qilib bering." : "Ushbu fayl mazmunini tahlil qilib bering.")
+          ? (attachments[0].isImage ? "Ushbu yuborilgan rasmni batafsil tushuntirib, tahlil qilib bering." : `Ushbu "${attachments[0].name}" faylini tahlil qiling.`)
           : "Salom");
+
+    const userEmail = (
+      req.body.email ||
+      req.body.userEmail ||
+      userProfile?.email ||
+      reqUserProfile?.email ||
+      fallbackUser?.email ||
+      loadActiveUser()?.email
+    )?.toString().trim().toLowerCase();
 
     // Get or create session
     let session = memoryStore.get(sessionId);
@@ -922,10 +1373,13 @@ app.post("/api/chat", async (req, res) => {
         title: effectiveMessage.slice(0, 30) + (effectiveMessage.length > 30 ? "..." : ""),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        userEmail: userEmail || undefined,
         messages: [],
         entityMemory: {},
       };
       memoryStore.set(sessionId, session);
+    } else if (userEmail && !session.userEmail) {
+      session.userEmail = userEmail;
     }
 
     const reasoningSteps: string[] = [];
@@ -1010,10 +1464,15 @@ app.post("/api/chat", async (req, res) => {
     };
 
     session.messages.push(userMsg, assistantMsg);
-    if (session.title === "Yangi suhbat" || session.title === "Yangi Suhbat" || session.title.startsWith("session-")) {
+    if (session.title === "Yangi suhbat" || session.title === "Yangi Suhbat" || session.title.startsWith("session-") || session.title === "UZUNITED AI Boshlang'ich Suhbat") {
       session.title = effectiveMessage.trim().slice(0, 36) + (effectiveMessage.trim().length > 36 ? "..." : "");
     }
     session.updatedAt = new Date().toISOString();
+    memoryStore.set(session.id, session);
+    saveSessions(memoryStore);
+
+    // Auto extract personal facts from user message
+    autoExtractAndSaveFacts(effectiveMessage, userProfile);
 
     res.json({
       sessionId: session.id,
@@ -1032,6 +1491,110 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
+// User Profile and Account Persistence Endpoints
+app.get("/api/user/profile", (req, res) => {
+  const activeUser = loadActiveUser();
+  res.json({ user: activeUser });
+});
+
+app.post("/api/user/profile", (req, res) => {
+  const { profile } = req.body;
+  if (!profile) {
+    return res.status(400).json({ error: "Profile ma'lumotlari kiritilmadi" });
+  }
+  saveActiveUser(profile);
+  if (profile.email) {
+    const users = loadSavedUsers();
+    users[profile.email.toLowerCase()] = {
+      ...(users[profile.email.toLowerCase()] || {}),
+      profile,
+    };
+    saveUsers(users);
+  }
+  res.json({ success: true, user: profile });
+});
+
+app.post("/api/auth/register", (req, res) => {
+  const { firstName, lastName, email, birthYear, password } = req.body;
+  if (!email || !password || !firstName) {
+    return res.status(400).json({ error: "Barcha majburiy maydonlarni to'ldiring" });
+  }
+  const cleanEmail = email.trim().toLowerCase();
+  const users = loadSavedUsers();
+  
+  const newUserProfile: UserProfileData = {
+    firstName: firstName.trim(),
+    lastName: lastName?.trim() || "",
+    email: cleanEmail,
+    birthYear: String(birthYear || "2000"),
+    interests: [],
+    learnedPreferences: [],
+  };
+
+  users[cleanEmail] = {
+    profile: newUserProfile,
+    passwordHash: password,
+  };
+  saveUsers(users);
+  saveActiveUser(newUserProfile);
+
+  res.json({ success: true, user: newUserProfile });
+});
+
+app.post("/api/auth/login", (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email va parolni kiriting" });
+  }
+  const cleanEmail = email.trim().toLowerCase();
+  const users = loadSavedUsers();
+  const existing = users[cleanEmail];
+
+  if (existing) {
+    if (existing.passwordHash && existing.passwordHash !== password) {
+      return res.status(401).json({ error: "Parol noto'g'ri kiritildi" });
+    }
+    saveActiveUser(existing.profile);
+    return res.json({ success: true, user: existing.profile });
+  }
+
+  // If new user logging in directly
+  const user: UserProfileData = {
+    firstName: cleanEmail.split("@")[0],
+    lastName: "",
+    email: cleanEmail,
+    birthYear: "2000",
+    interests: [],
+    learnedPreferences: [],
+  };
+  users[cleanEmail] = {
+    profile: user,
+    passwordHash: password,
+  };
+  saveUsers(users);
+  saveActiveUser(user);
+
+  res.json({ success: true, user });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  saveActiveUser(null);
+  res.json({ success: true });
+});
+
+// 3. Admin endpoints (Directives disabled)
+app.get("/api/admin/directives", (req, res) => {
+  res.json({ directives: [] });
+});
+
+app.post("/api/admin/directives", (req, res) => {
+  res.json({ success: true, directives: [] });
+});
+
+app.post("/api/admin/command", (req, res) => {
+  res.json({ success: true, directives: [] });
+});
+
 // 3. Direct Search testing endpoint
 app.post("/api/search", async (req, res) => {
   try {
@@ -1044,47 +1607,160 @@ app.post("/api/search", async (req, res) => {
   }
 });
 
-// 4. Memory Sessions list
+// 4. Memory Sessions list (partitioned by user email)
 app.get("/api/memory/sessions", (req, res) => {
-  const sessions = Array.from(memoryStore.values()).map(s => ({
+  const queryEmail = (req.query.email as string)?.trim().toLowerCase();
+  const activeUser = loadActiveUser();
+  const targetEmail = queryEmail || activeUser?.email?.trim().toLowerCase();
+
+  const sessions = Array.from(memoryStore.values());
+
+  if (targetEmail) {
+    // If default session has no email, associate with this user
+    for (const s of sessions) {
+      if (!s.userEmail && s.id === defaultSessionId) {
+        s.userEmail = targetEmail;
+      }
+    }
+    saveSessions(memoryStore);
+
+    let userSessions = sessions.filter(s => s.userEmail?.toLowerCase() === targetEmail);
+
+    // If user has no sessions yet, create an initial personalized session for them
+    if (userSessions.length === 0) {
+      const initialId = `session-${Date.now()}`;
+      const newSession: ChatSession = {
+        id: initialId,
+        title: "UZUNITED AI Suhbat",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        userEmail: targetEmail,
+        messages: [
+          {
+            id: `msg-${Date.now()}`,
+            role: "assistant",
+            content: `Assalomu alaykum! Men **UZUNITED AI** man. Ushbu emailingiz (${targetEmail}) bo'yicha barcha suhbatlarimiz xavfsiz va to'liq saqlanadi. Qanday savolingiz bor yoki nima haqida gaplashamiz? 😊`,
+            timestamp: new Date().toISOString(),
+          }
+        ],
+        entityMemory: {},
+      };
+      memoryStore.set(initialId, newSession);
+      saveSessions(memoryStore);
+      userSessions = [newSession];
+    }
+
+    const list = userSessions.map(s => ({
+      id: s.id,
+      title: s.title,
+      messageCount: s.messages.length,
+      createdAt: s.createdAt,
+      updatedAt: s.updatedAt,
+      userEmail: s.userEmail,
+      lastEntity: s.entityMemory?.lastEntity || null,
+    })).sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+
+    return res.json({ sessions: list });
+  }
+
+  const list = sessions.map(s => ({
     id: s.id,
     title: s.title,
     messageCount: s.messages.length,
     createdAt: s.createdAt,
     updatedAt: s.updatedAt,
-    lastEntity: s.entityMemory.lastEntity || null,
+    userEmail: s.userEmail,
+    lastEntity: s.entityMemory?.lastEntity || null,
   })).sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
-  res.json({ sessions });
+  res.json({ sessions: list });
 });
 
 // 4b. Get specific session
 app.get("/api/memory/sessions/:id", (req, res) => {
   const { id } = req.params;
-  const session = memoryStore.get(id);
+  const queryEmail = (req.query.email as string)?.trim().toLowerCase();
+  const activeUser = loadActiveUser();
+  const targetEmail = queryEmail || activeUser?.email?.trim().toLowerCase();
+
+  let session = memoryStore.get(id);
   if (!session) {
-    return res.status(404).json({ error: "Suhbat topilmadi" });
+    session = {
+      id,
+      title: "Yangi suhbat",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      userEmail: targetEmail || undefined,
+      messages: [],
+      entityMemory: {},
+    };
+    memoryStore.set(id, session);
+    saveSessions(memoryStore);
+  } else if (!session.userEmail && targetEmail) {
+    session.userEmail = targetEmail;
+    saveSessions(memoryStore);
   }
   res.json({ session });
 });
 
-// 4c. Delete specific session individually
+// 4c. Synchronize session messages from client
+app.post("/api/memory/sessions/:id/sync", (req, res) => {
+  const { id } = req.params;
+  const { messages, title, email, userEmail } = req.body;
+  const activeUser = loadActiveUser();
+  const targetEmail = (email || userEmail || activeUser?.email)?.toString().trim().toLowerCase();
+
+  let session = memoryStore.get(id);
+  if (!session) {
+    session = {
+      id,
+      title: title || "Yangi suhbat",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      userEmail: targetEmail || undefined,
+      messages: Array.isArray(messages) ? messages : [],
+      entityMemory: {},
+    };
+  } else {
+    if (Array.isArray(messages) && messages.length > 0) {
+      session.messages = messages;
+    }
+    if (title && (session.title === "Yangi suhbat" || !session.title)) {
+      session.title = title;
+    }
+    if (targetEmail && !session.userEmail) {
+      session.userEmail = targetEmail;
+    }
+    session.updatedAt = new Date().toISOString();
+  }
+  memoryStore.set(id, session);
+  saveSessions(memoryStore);
+  res.json({ success: true, session });
+});
+
+// 4d. Delete specific session individually
 app.delete("/api/memory/sessions/:id", (req, res) => {
   const { id } = req.params;
   const existed = memoryStore.has(id);
   if (existed) {
     memoryStore.delete(id);
+    saveSessions(memoryStore);
   }
   res.json({ success: true, deletedId: id });
 });
 
 // 5. Clear or create new session
 app.post("/api/memory/new-session", (req, res) => {
+  const reqEmail = (req.body?.email || req.body?.userEmail || req.query?.email as string)?.toString().trim().toLowerCase();
+  const activeUser = loadActiveUser();
+  const targetEmail = reqEmail || activeUser?.email?.trim().toLowerCase();
+
   const newId = `session-${Date.now()}`;
   const newSession: ChatSession = {
     id: newId,
     title: "Yangi suhbat",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    userEmail: targetEmail || undefined,
     messages: [
       {
         id: `msg-${Date.now()}`,
@@ -1096,7 +1772,33 @@ app.post("/api/memory/new-session", (req, res) => {
     entityMemory: {},
   };
   memoryStore.set(newId, newSession);
+  saveSessions(memoryStore);
   res.json({ session: newSession });
+});
+
+// 5b. Get AI long-term memory facts
+app.get("/api/memory/facts", (req, res) => {
+  const memory = loadAiMemory();
+  res.json({ facts: memory.facts || [] });
+});
+
+// 5c. Add a fact directly to memory
+app.post("/api/memory/facts", (req, res) => {
+  const { fact, category = "fact" } = req.body;
+  if (!fact || typeof fact !== "string") {
+    return res.status(400).json({ error: "Fakt matni kiritilmadi" });
+  }
+  const added = addAiMemoryFact(fact, category);
+  const memory = loadAiMemory();
+  res.json({ success: true, added, facts: memory.facts });
+});
+
+// 5d. Delete a fact from memory
+app.delete("/api/memory/facts/:id", (req, res) => {
+  const { id } = req.params;
+  const deleted = deleteAiMemoryFact(id);
+  const memory = loadAiMemory();
+  res.json({ success: true, deleted, facts: memory.facts });
 });
 
 // 6. Test local Ollama / LM Studio connection

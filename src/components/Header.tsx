@@ -7,10 +7,15 @@ import {
   Box, 
   Cpu, 
   Check, 
-  ShieldCheck, 
-  User 
+  User,
+  MessageSquare,
+  Layers,
+  FileCode,
+  Database
 } from 'lucide-react';
 import { UserProfile } from '../types';
+
+export type AppTabType = 'chat' | 'architecture' | 'codebase' | 'models' | 'memory';
 
 interface HeaderProps {
   onOpenMenu: () => void;
@@ -20,6 +25,8 @@ interface HeaderProps {
   onSelectModel: (model: string) => void;
   user: UserProfile | null;
   tokenCount?: number;
+  currentTab?: AppTabType;
+  onSelectTab?: (tab: AppTabType) => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -30,6 +37,8 @@ export const Header: React.FC<HeaderProps> = ({
   onSelectModel,
   user,
   tokenCount = 842,
+  currentTab = 'chat',
+  onSelectTab,
 }) => {
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
 
@@ -157,6 +166,78 @@ export const Header: React.FC<HeaderProps> = ({
 
         </div>
       </div>
+
+      {/* Navigation Tab Pills */}
+      {onSelectTab && (
+        <div className="border-t border-slate-200/70 bg-white/90 backdrop-blur-xs px-3 sm:px-4 py-1.5 overflow-x-auto">
+          <div className="max-w-4xl mx-auto flex items-center gap-1 sm:gap-2 text-xs">
+            <button
+              id="tab-btn-chat"
+              onClick={() => onSelectTab('chat')}
+              className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 font-medium transition-all cursor-pointer whitespace-nowrap text-xs ${
+                currentTab === 'chat'
+                  ? 'bg-blue-600 text-white shadow-xs font-semibold'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+              }`}
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              <span>Suhbat (Chat)</span>
+            </button>
+
+            <button
+              id="tab-btn-architecture"
+              onClick={() => onSelectTab('architecture')}
+              className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 font-medium transition-all cursor-pointer whitespace-nowrap text-xs ${
+                currentTab === 'architecture'
+                  ? 'bg-blue-600 text-white shadow-xs font-semibold'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>Arxitektura</span>
+            </button>
+
+            <button
+              id="tab-btn-codebase"
+              onClick={() => onSelectTab('codebase')}
+              className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 font-medium transition-all cursor-pointer whitespace-nowrap text-xs ${
+                currentTab === 'codebase'
+                  ? 'bg-blue-600 text-white shadow-xs font-semibold'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+              }`}
+            >
+              <FileCode className="w-3.5 h-3.5" />
+              <span>Python Kodlar</span>
+            </button>
+
+            <button
+              id="tab-btn-models"
+              onClick={() => onSelectTab('models')}
+              className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 font-medium transition-all cursor-pointer whitespace-nowrap text-xs ${
+                currentTab === 'models'
+                  ? 'bg-blue-600 text-white shadow-xs font-semibold'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+              }`}
+            >
+              <Cpu className="w-3.5 h-3.5" />
+              <span>Lokal Modellar</span>
+            </button>
+
+            <button
+              id="tab-btn-memory"
+              onClick={() => onSelectTab('memory')}
+              className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 font-medium transition-all cursor-pointer whitespace-nowrap text-xs ${
+                currentTab === 'memory'
+                  ? 'bg-blue-600 text-white shadow-xs font-semibold'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+              }`}
+            >
+              <Database className="w-3.5 h-3.5" />
+              <span>Xotira Tizimi</span>
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

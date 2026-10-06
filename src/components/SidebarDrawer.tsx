@@ -9,9 +9,14 @@ import {
   Sparkles, 
   ShieldCheck, 
   Award,
-  Heart
+  Heart,
+  Layers,
+  FileCode,
+  Cpu,
+  Database
 } from 'lucide-react';
 import { ChatSession, UserProfile } from '../types';
+import { AppTabType } from './Header';
 
 interface SidebarDrawerProps {
   isOpen: boolean;
@@ -23,6 +28,8 @@ interface SidebarDrawerProps {
   onDeleteSession: (id: string) => void;
   user: UserProfile | null;
   onLogout: () => void;
+  currentTab?: AppTabType;
+  onSelectTab?: (tab: AppTabType) => void;
 }
 
 export const SidebarDrawer: React.FC<SidebarDrawerProps> = ({
@@ -35,6 +42,8 @@ export const SidebarDrawer: React.FC<SidebarDrawerProps> = ({
   onDeleteSession,
   user,
   onLogout,
+  currentTab = 'chat',
+  onSelectTab,
 }) => {
   if (!isOpen) return null;
 
@@ -84,10 +93,99 @@ export const SidebarDrawer: React.FC<SidebarDrawerProps> = ({
           </button>
         </div>
 
+        {/* Module Navigation Links */}
+        {onSelectTab && (
+          <div className="p-3 border-b border-slate-100 space-y-1">
+            <div className="px-2 py-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+              Tizim Bo'limlari
+            </div>
+            
+            <button
+              onClick={() => {
+                onSelectTab('chat');
+                onClose();
+              }}
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition-all ${
+                currentTab === 'chat'
+                  ? 'bg-blue-50 text-blue-700 font-semibold border border-blue-200'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <MessageSquare className="w-4 h-4 text-blue-600" />
+              <span>UZUNITED AI Suhbat</span>
+            </button>
+
+            <button
+              onClick={() => {
+                onSelectTab('architecture');
+                onClose();
+              }}
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition-all ${
+                currentTab === 'architecture'
+                  ? 'bg-blue-50 text-blue-700 font-semibold border border-blue-200'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <Layers className="w-4 h-4 text-indigo-600" />
+              <span>Tizim Arxitekturasi (Sxema)</span>
+            </button>
+
+            <button
+              onClick={() => {
+                onSelectTab('codebase');
+                onClose();
+              }}
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition-all ${
+                currentTab === 'codebase'
+                  ? 'bg-blue-50 text-blue-700 font-semibold border border-blue-200'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <FileCode className="w-4 h-4 text-emerald-600" />
+              <span>Python Kodlar To'plami</span>
+            </button>
+
+            <button
+              onClick={() => {
+                onSelectTab('models');
+                onClose();
+              }}
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition-all ${
+                currentTab === 'models'
+                  ? 'bg-blue-50 text-blue-700 font-semibold border border-blue-200'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <Cpu className="w-4 h-4 text-cyan-600" />
+              <span>Lokal Modellar (Ollama)</span>
+            </button>
+
+            <button
+              onClick={() => {
+                onSelectTab('memory');
+                onClose();
+              }}
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition-all ${
+                currentTab === 'memory'
+                  ? 'bg-blue-50 text-blue-700 font-semibold border border-blue-200'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <Database className="w-4 h-4 text-amber-600" />
+              <span>SQLite Xotira & Kontekst</span>
+            </button>
+          </div>
+        )}
+
         {/* Chat History List */}
         <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
-          <div className="px-2 py-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
-            Mening suhbatlarim ({sessions.length})
+          <div className="px-2 py-1 flex items-center justify-between text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+            <span>Suhbatlar tarixi ({sessions.length})</span>
+            {user?.email && (
+              <span className="text-[10px] text-blue-600 lowercase font-medium truncate max-w-[140px]" title={user.email}>
+                {user.email}
+              </span>
+            )}
           </div>
 
           {sessions.length === 0 ? (

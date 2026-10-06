@@ -1,9 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import { Header } from './components/Header';
+import { Header, AppTabType } from './components/Header';
 import { ChatInterface } from './components/ChatInterface';
 import { SidebarDrawer } from './components/SidebarDrawer';
 import { AuthModal } from './components/AuthModal';
 import { ProfileModal } from './components/ProfileModal';
+import { ArchitectureViewer } from './components/ArchitectureViewer';
+import { CodebaseExplorer } from './components/CodebaseExplorer';
+import { LocalLLMComparison } from './components/LocalLLMComparison';
+import { MemoryInspector } from './components/MemoryInspector';
 import { ChatMessage, ChatSession, UserProfile, FileAttachment } from './types';
 import { generateClientResponse } from './utils/clientAiEngine';
 
@@ -17,9 +21,11 @@ export default function App() {
     }
   });
 
-  const [isAuthModalOpen, setIsAuthModalOpen] = useState(!user);
+  const [currentTab, setCurrentTab] = useState<AppTabType>('chat');
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
+
   const [selectedModel, setSelectedModel] = useState('UZUNITED AI v1.0');
   const [tokenCount, setTokenCount] = useState(842);
 
@@ -51,14 +57,24 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [activeReasoningSteps, setActiveReasoningSteps] = useState<string[]>([]);
 
-  // Fetch list of all sessions
-  const fetchSessions = async () => {
+  // Fetch list of all sessions partitioned by user email
+  const fetchSessions = async (targetEmail?: string, autoRestore = false) => {
     try {
-      const res = await fetch('/api/memory/sessions');
+      const emailToUse = targetEmail !== undefined ? targetEmail : (user?.email || '');
+      const url = emailToUse ? `/api/memory/sessions?email=${encodeURIComponent(emailToUse)}` : '/api/memory/sessions';
+      const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
-        if (data.sessions) {
+        if (data.sessions && data.sessions.length > 0) {
           setSessions(data.sessions);
+          if (autoRestore) {
+            const storageKey = emailToUse ? `uzunited_current_session_${emailToUse}` : 'uzunited_current_session';
+            const savedCurrentId = localStorage.getItem(storageKey);
+            const target = data.sessions.find((s: any) => s.id === savedCurrentId) || data.sessions[0];
+            if (target && target.messageCount > 0) {
+              handleSelectSession(target.id, emailToUse);
+            }
+          }
         }
       }
     } catch (e) {
@@ -66,10 +82,42 @@ export default function App() {
     }
   };
 
+  // Fetch active user profile from server for true cross-session persistence
+  const fetchUserProfile = async () => {
+    try {
+      const res = await fetch('/api/user/profile');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.user) {
+          setUser(prev => {
+            const merged = { ...prev, ...data.user };
+            localStorage.setItem('uzunited_user', JSON.stringify(merged));
+            return merged;
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to load user profile from server', e);
+    }
+  };
+
   // Initial load
   useEffect(() => {
-    fetchSessions();
+    try {
+      localStorage.removeItem('uzunited_admin_mode');
+      localStorage.removeItem('uzunited_admin_directives');
+    } catch {}
+    fetchUserProfile();
   }, []);
+
+  // Sync sessions whenever user email is loaded or changed
+  useEffect(() => {
+    if (user?.email) {
+      fetchSessions(user.email, true);
+    } else {
+      fetchSessions('', true);
+    }
+  }, [user?.email]);
 
   // Send message handler supporting attachments
   const handleSendMessage = async (
@@ -108,13 +156,15 @@ export default function App() {
       const executeRequest = async (isRetry = false): Promise<any> => {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 12000);
+          const timeoutId = setTimeout(() => controller.abort(), 35000);
 
           const res = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               sessionId,
+              email: user?.email,
+              userEmail: user?.email,
               message: effectiveContent,
               isDeepSearch,
               isAiMode,
@@ -142,7 +192,7 @@ export default function App() {
       };
 
       const data = await executeRequest();
-      
+
       if (data.reasoningSteps) {
         setActiveReasoningSteps(data.reasoningSteps);
       }
@@ -164,8 +214,8 @@ export default function App() {
         });
       }
 
-      // Refresh sessions list
-      fetchSessions();
+      // Refresh sessions list for this user email
+      fetchSessions(user?.email);
     } catch (err: any) {
       console.warn('Chat request handled with client AI engine:', err);
       
@@ -184,7 +234,22 @@ export default function App() {
         content: fallbackResult.answer,
         timestamp: new Date().toISOString(),
       };
-      setMessages(prev => [...prev, assistantMsg]);
+      
+      setMessages(prev => {
+        const nextMsgs = [...prev, assistantMsg];
+        // Ensure chat history is immediately synchronized and persisted to backend disk
+        fetch(`/api/memory/sessions/${sessionId}/sync`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: nextMsgs,
+            email: user?.email,
+            userEmail: user?.email,
+            title: effectiveContent.slice(0, 30) + (effectiveContent.length > 30 ? '...' : ''),
+          }),
+        }).then(() => fetchSessions(user?.email)).catch(() => {});
+        return nextMsgs;
+      });
     } finally {
       setIsLoading(false);
     }
@@ -193,17 +258,25 @@ export default function App() {
   // Create new chat
   const handleNewChat = async () => {
     try {
-      const res = await fetch('/api/memory/new-session', { method: 'POST' });
+      const res = await fetch('/api/memory/new-session', { 
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: user?.email, userEmail: user?.email }),
+      });
       const data = await res.json();
       if (data.session) {
         setSessionId(data.session.id);
+        const storageKey = user?.email ? `uzunited_current_session_${user.email}` : 'uzunited_current_session';
+        localStorage.setItem(storageKey, data.session.id);
         setMessages(data.session.messages);
         setActiveReasoningSteps([]);
-        fetchSessions();
+        fetchSessions(user?.email);
       }
     } catch (e) {
       const newId = `session-${Date.now()}`;
       setSessionId(newId);
+      const storageKey = user?.email ? `uzunited_current_session_${user.email}` : 'uzunited_current_session';
+      localStorage.setItem(storageKey, newId);
       setMessages([
         {
           id: `msg-${Date.now()}`,
@@ -217,9 +290,13 @@ export default function App() {
   };
 
   // Select an existing session
-  const handleSelectSession = async (targetId: string) => {
+  const handleSelectSession = async (targetId: string, emailToUse?: string) => {
+    const curEmail = emailToUse !== undefined ? emailToUse : (user?.email || '');
+    const storageKey = curEmail ? `uzunited_current_session_${curEmail}` : 'uzunited_current_session';
+    localStorage.setItem(storageKey, targetId);
     try {
-      const res = await fetch(`/api/memory/sessions/${targetId}`);
+      const url = curEmail ? `/api/memory/sessions/${targetId}?email=${encodeURIComponent(curEmail)}` : `/api/memory/sessions/${targetId}`;
+      const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
         if (data.session) {
@@ -255,18 +332,32 @@ export default function App() {
   // Auth callbacks
   const handleAuthSuccess = (authenticatedUser: UserProfile) => {
     setUser(authenticatedUser);
+    localStorage.setItem('uzunited_user', JSON.stringify(authenticatedUser));
     setIsAuthModalOpen(false);
+    fetchSessions(authenticatedUser.email, true);
   };
 
   // User profile update
-  const handleUpdateUser = (updated: UserProfile) => {
+  const handleUpdateUser = async (updated: UserProfile) => {
     setUser(updated);
     localStorage.setItem('uzunited_user', JSON.stringify(updated));
+    try {
+      await fetch('/api/user/profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile: updated }),
+      });
+    } catch (e) {
+      console.warn('Could not sync user profile to server', e);
+    }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     localStorage.removeItem('uzunited_user');
     setUser(null);
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch {}
     setIsAuthModalOpen(true);
   };
 
@@ -288,20 +379,53 @@ export default function App() {
         onSelectModel={setSelectedModel}
         user={user}
         tokenCount={tokenCount}
+        currentTab={currentTab}
+        onSelectTab={setCurrentTab}
       />
 
-      {/* Main Chat Viewport */}
+      {/* Main Multi-Module Viewport */}
       <main className="flex-1 flex flex-col overflow-hidden">
-        <ChatInterface
-          messages={messages}
-          onSendMessage={handleSendMessage}
-          isLoading={isLoading}
-          activeReasoningSteps={activeReasoningSteps}
-          onNewSession={handleNewChat}
-          selectedModel={selectedModel}
-          user={user}
-          onOpenProfile={() => setIsProfileModalOpen(true)}
-        />
+        {currentTab === 'chat' && (
+          <ChatInterface
+            messages={messages}
+            onSendMessage={handleSendMessage}
+            isLoading={isLoading}
+            activeReasoningSteps={activeReasoningSteps}
+            onNewSession={handleNewChat}
+            selectedModel={selectedModel}
+            user={user}
+            onOpenProfile={() => setIsProfileModalOpen(true)}
+          />
+        )}
+
+        {currentTab === 'architecture' && (
+          <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
+            <ArchitectureViewer />
+          </div>
+        )}
+
+        {currentTab === 'codebase' && (
+          <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
+            <CodebaseExplorer />
+          </div>
+        )}
+
+        {currentTab === 'models' && (
+          <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
+            <LocalLLMComparison />
+          </div>
+        )}
+
+        {currentTab === 'memory' && (
+          <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
+            <MemoryInspector
+              sessions={sessions}
+              currentSessionId={sessionId}
+              messages={messages}
+              onClearSession={handleNewChat}
+            />
+          </div>
+        )}
       </main>
 
       {/* Slide-out Sidebar Drawer with Chat History and individual delete buttons */}
@@ -315,6 +439,8 @@ export default function App() {
         onDeleteSession={handleDeleteSession}
         user={user}
         onLogout={handleLogout}
+        currentTab={currentTab}
+        onSelectTab={setCurrentTab}
       />
 
       {/* Registration & Login Modal on first entrance */}

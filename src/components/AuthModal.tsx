@@ -16,6 +16,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess }) => {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   if (!isOpen) return null;
 
@@ -23,7 +24,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess }) => {
   const currentYear = new Date().getFullYear();
   const years = Array.from({ length: currentYear - 1950 + 1 }, (_, i) => currentYear - i);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
@@ -50,43 +51,99 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess }) => {
         return;
       }
 
-      const newUser: UserProfile = {
-        firstName: firstName.trim(),
-        lastName: lastName.trim(),
-        email: email.trim().toLowerCase(),
-        birthYear: birthYear,
-      };
+      setIsSubmitting(true);
+      try {
+        const res = await fetch('/api/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            firstName: firstName.trim(),
+            lastName: lastName.trim(),
+            email: email.trim().toLowerCase(),
+            birthYear,
+            password,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "Ro'yxatdan o'tishda xatolik yuz berdi");
+        }
 
-      // Save user to localStorage
-      localStorage.setItem('uzunited_user', JSON.stringify(newUser));
-      localStorage.setItem(`uzunited_pwd_${newUser.email}`, password);
-      onSuccess(newUser);
+        const registeredUser: UserProfile = data.user || {
+          firstName: firstName.trim(),
+          lastName: lastName.trim(),
+          email: email.trim().toLowerCase(),
+          birthYear,
+        };
+
+        localStorage.setItem('uzunited_user', JSON.stringify(registeredUser));
+        localStorage.setItem(`uzunited_pwd_${registeredUser.email}`, password);
+        onSuccess(registeredUser);
+      } catch (err: any) {
+        // Fallback to offline localStorage
+        const newUser: UserProfile = {
+          firstName: firstName.trim(),
+          lastName: lastName.trim(),
+          email: email.trim().toLowerCase(),
+          birthYear,
+        };
+        localStorage.setItem('uzunited_user', JSON.stringify(newUser));
+        localStorage.setItem(`uzunited_pwd_${newUser.email}`, password);
+        onSuccess(newUser);
+      } finally {
+        setIsSubmitting(false);
+      }
     } else {
       // Login mode
-      const savedUserStr = localStorage.getItem('uzunited_user');
-      if (savedUserStr) {
-        try {
-          const savedUser: UserProfile = JSON.parse(savedUserStr);
-          const savedPwd = localStorage.getItem(`uzunited_pwd_${email.trim().toLowerCase()}`);
-          if (savedPwd && savedPwd !== password) {
-            setError("Parol noto'g'ri kiritildi.");
-            return;
-          }
-          if (savedUser.email === email.trim().toLowerCase()) {
-            onSuccess(savedUser);
-            return;
-          }
-        } catch {}
+      setIsSubmitting(true);
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: email.trim().toLowerCase(),
+            password,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setError(data.error || "Kirishda xatolik yuz berdi");
+          setIsSubmitting(false);
+          return;
+        }
+
+        const loggedInUser: UserProfile = data.user;
+        localStorage.setItem('uzunited_user', JSON.stringify(loggedInUser));
+        onSuccess(loggedInUser);
+      } catch (err: any) {
+        // Fallback local verification
+        const savedUserStr = localStorage.getItem('uzunited_user');
+        if (savedUserStr) {
+          try {
+            const savedUser: UserProfile = JSON.parse(savedUserStr);
+            const savedPwd = localStorage.getItem(`uzunited_pwd_${email.trim().toLowerCase()}`);
+            if (savedPwd && savedPwd !== password) {
+              setError("Parol noto'g'ri kiritildi.");
+              setIsSubmitting(false);
+              return;
+            }
+            if (savedUser.email === email.trim().toLowerCase()) {
+              onSuccess(savedUser);
+              return;
+            }
+          } catch {}
+        }
+        const user: UserProfile = {
+          firstName: email.split('@')[0],
+          lastName: '',
+          email: email.trim().toLowerCase(),
+          birthYear: '2000',
+        };
+        localStorage.setItem('uzunited_user', JSON.stringify(user));
+        onSuccess(user);
+      } finally {
+        setIsSubmitting(false);
       }
-      // If no exact match or first time login with existing credentials, authenticate
-      const user: UserProfile = {
-        firstName: email.split('@')[0],
-        lastName: '',
-        email: email.trim().toLowerCase(),
-        birthYear: '2000',
-      };
-      localStorage.setItem('uzunited_user', JSON.stringify(user));
-      onSuccess(user);
     }
   };
 
