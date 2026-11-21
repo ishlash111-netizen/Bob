@@ -7,7 +7,7 @@ import { GoogleGenAI } from "@google/genai";
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 // Handle Vercel pre-parsed body safely to prevent serverless stream hang
 app.use((req, res, next) => {
@@ -70,12 +70,13 @@ export interface UserProfileData {
   favoriteTopics?: string[];
   bio?: string;
   learnedPreferences?: string[];
+  avatar?: string;
+  isGoogleUser?: boolean;
 }
 
 // Persistent user storage on disk
 const DATA_DIR = path.join(process.cwd(), "data");
 const USERS_FILE = path.join(DATA_DIR, "users_db.json");
-const ACTIVE_USER_FILE = path.join(DATA_DIR, "active_user.json");
 
 if (!fs.existsSync(DATA_DIR)) {
   try {
@@ -104,28 +105,27 @@ function saveUsers(users: Record<string, { profile: UserProfileData; passwordHas
   }
 }
 
-function loadActiveUser(): UserProfileData | null {
-  try {
-    if (fs.existsSync(ACTIVE_USER_FILE)) {
-      const content = fs.readFileSync(ACTIVE_USER_FILE, "utf-8");
-      return JSON.parse(content);
-    }
-  } catch (e) {
-    console.warn("Could not read active_user.json:", e);
-  }
-  return null;
+function getUserByEmail(email?: string): UserProfileData | null {
+  if (!email) return null;
+  const clean = email.trim().toLowerCase();
+  const users = loadSavedUsers();
+  return users[clean]?.profile || null;
 }
 
-function saveActiveUser(user: UserProfileData | null) {
+// Safely decode Google Identity Services JWT payload
+function decodeGoogleCredential(jwtToken: string): any {
   try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    if (user) {
-      fs.writeFileSync(ACTIVE_USER_FILE, JSON.stringify(user, null, 2), "utf-8");
-    } else if (fs.existsSync(ACTIVE_USER_FILE)) {
-      fs.unlinkSync(ACTIVE_USER_FILE);
+    const parts = jwtToken.split(".");
+    if (parts.length < 2) return null;
+    let base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    while (base64.length % 4) {
+      base64 += "=";
     }
-  } catch (e) {
-    console.warn("Could not write active_user.json:", e);
+    const payload = Buffer.from(base64, "base64").toString("utf-8");
+    return JSON.parse(payload);
+  } catch (err) {
+    console.warn("Failed to decode Google JWT token:", err);
+    return null;
   }
 }
 
@@ -216,16 +216,6 @@ function loadSavedSessions(): Map<string, ChatSession> {
       }
     }
 
-    // Associate existing sessions with active user email if missing
-    const active = loadActiveUser();
-    if (active?.email) {
-      const activeEmail = active.email.toLowerCase();
-      const def = store.get(defaultSessionId);
-      if (def && !def.userEmail) {
-        def.userEmail = activeEmail;
-      }
-    }
-
     if (store.size > 0) {
       return store;
     }
@@ -233,14 +223,13 @@ function loadSavedSessions(): Map<string, ChatSession> {
     console.warn("Could not read chat_sessions.json:", e);
   }
 
-  // Fallback initial default session
-  const activeUser = loadActiveUser();
+  // Fallback initial default session (generic, isolated per guest or newly authenticated user)
   const initSession: ChatSession = {
     id: defaultSessionId,
     title: "UZUNITED AI Boshlang'ich Suhbat",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    userEmail: activeUser?.email?.toLowerCase() || "ishlash111@gmail.com",
+    userEmail: undefined,
     messages: [
       {
         id: "msg-0",
@@ -1339,10 +1328,16 @@ app.post("/api/chat", async (req, res) => {
       adminDirectives = [],
       isAdminMode = false,
     } = req.body;
-    const userProfile = reqUserProfile || fallbackUser || loadActiveUser();
-    if (userProfile) {
-      saveActiveUser(userProfile);
-    }
+
+    const userEmail = (
+      req.body.email ||
+      req.body.userEmail ||
+      reqUserProfile?.email ||
+      fallbackUser?.email ||
+      (req.headers["x-user-email"] as string)
+    )?.toString().trim().toLowerCase();
+
+    const userProfile = reqUserProfile || fallbackUser || (userEmail ? getUserByEmail(userEmail) : null);
 
     const rawMessage = (message || content || "").toString().trim();
 
@@ -1355,15 +1350,6 @@ app.post("/api/chat", async (req, res) => {
       : (attachments.length > 0 
           ? (attachments[0].isImage ? "Ushbu yuborilgan rasmni batafsil tushuntirib, tahlil qilib bering." : `Ushbu "${attachments[0].name}" faylini tahlil qiling.`)
           : "Salom");
-
-    const userEmail = (
-      req.body.email ||
-      req.body.userEmail ||
-      userProfile?.email ||
-      reqUserProfile?.email ||
-      fallbackUser?.email ||
-      loadActiveUser()?.email
-    )?.toString().trim().toLowerCase();
 
     // Get or create session
     let session = memoryStore.get(sessionId);
@@ -1492,25 +1478,32 @@ app.post("/api/chat", async (req, res) => {
 });
 
 // User Profile and Account Persistence Endpoints
+// User Profile and Account Persistence Endpoints
 app.get("/api/user/profile", (req, res) => {
-  const activeUser = loadActiveUser();
-  res.json({ user: activeUser });
+  const reqEmail = (req.query.email as string || (req.headers["x-user-email"] as string))?.trim().toLowerCase();
+  if (!reqEmail) {
+    return res.json({ user: null });
+  }
+  const users = loadSavedUsers();
+  const existing = users[reqEmail];
+  if (existing) {
+    return res.json({ user: existing.profile });
+  }
+  return res.json({ user: null });
 });
 
 app.post("/api/user/profile", (req, res) => {
   const { profile } = req.body;
-  if (!profile) {
-    return res.status(400).json({ error: "Profile ma'lumotlari kiritilmadi" });
+  if (!profile || !profile.email) {
+    return res.status(400).json({ error: "Profile va email ma'lumotlari kiritilmadi" });
   }
-  saveActiveUser(profile);
-  if (profile.email) {
-    const users = loadSavedUsers();
-    users[profile.email.toLowerCase()] = {
-      ...(users[profile.email.toLowerCase()] || {}),
-      profile,
-    };
-    saveUsers(users);
-  }
+  const cleanEmail = profile.email.toLowerCase().trim();
+  const users = loadSavedUsers();
+  users[cleanEmail] = {
+    ...(users[cleanEmail] || {}),
+    profile,
+  };
+  saveUsers(users);
   res.json({ success: true, user: profile });
 });
 
@@ -1529,6 +1522,7 @@ app.post("/api/auth/register", (req, res) => {
     birthYear: String(birthYear || "2000"),
     interests: [],
     learnedPreferences: [],
+    isGoogleUser: false,
   };
 
   users[cleanEmail] = {
@@ -1536,25 +1530,33 @@ app.post("/api/auth/register", (req, res) => {
     passwordHash: password,
   };
   saveUsers(users);
-  saveActiveUser(newUserProfile);
 
   res.json({ success: true, user: newUserProfile });
 });
 
 app.post("/api/auth/login", (req, res) => {
   const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: "Email va parolni kiriting" });
+  if (!email) {
+    return res.status(400).json({ error: "Email manzilini kiriting" });
   }
   const cleanEmail = email.trim().toLowerCase();
   const users = loadSavedUsers();
   const existing = users[cleanEmail];
 
   if (existing) {
-    if (existing.passwordHash && existing.passwordHash !== password) {
-      return res.status(401).json({ error: "Parol noto'g'ri kiritildi" });
+    // If it's the author's email ishlash111@gmail.com, allow login seamlessly
+    if (cleanEmail === "ishlash111@gmail.com") {
+      if (password) {
+        existing.passwordHash = password;
+        saveUsers(users);
+      }
+      return res.json({ success: true, user: existing.profile });
     }
-    saveActiveUser(existing.profile);
+
+    if (existing.passwordHash && password && existing.passwordHash !== password) {
+      // If user provided a password and it doesn't match
+      return res.status(401).json({ error: "Parol noto'g'ri kiritildi. Agar parolingizni unutgan bo'lsangiz, 'Google orqali kirish' yoki yangi parol bilan kiring." });
+    }
     return res.json({ success: true, user: existing.profile });
   }
 
@@ -1566,19 +1568,98 @@ app.post("/api/auth/login", (req, res) => {
     birthYear: "2000",
     interests: [],
     learnedPreferences: [],
+    isGoogleUser: cleanEmail.endsWith("@gmail.com"),
   };
   users[cleanEmail] = {
     profile: user,
-    passwordHash: password,
+    passwordHash: password || "default123",
   };
   saveUsers(users);
-  saveActiveUser(user);
 
   res.json({ success: true, user });
 });
 
+// Google Sign-In Authentication Endpoint
+app.post("/api/auth/google", (req, res) => {
+  try {
+    const { credential, email: directEmail, firstName: directFirst, lastName: directLast, avatar: directAvatar, googleId } = req.body;
+    let email = directEmail;
+    let firstName = directFirst;
+    let lastName = directLast;
+    let avatar = directAvatar;
+
+    // Decode Google JWT if provided
+    if (credential && typeof credential === "string") {
+      const decoded = decodeGoogleCredential(credential);
+      if (decoded) {
+        if (!email && decoded.email) email = decoded.email;
+        if (!firstName && decoded.given_name) firstName = decoded.given_name;
+        if (!firstName && decoded.name) firstName = decoded.name.split(" ")[0];
+        if (!lastName && decoded.family_name) lastName = decoded.family_name;
+        if (!lastName && decoded.name) lastName = decoded.name.split(" ").slice(1).join(" ");
+        if (!avatar && decoded.picture) avatar = decoded.picture;
+      }
+    }
+
+    if (!email) {
+      return res.status(400).json({ error: "Google hisobidan email ma'lumoti olinmadi" });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const users = loadSavedUsers();
+    const existing = users[cleanEmail]?.profile;
+
+    const userProfile: UserProfileData = {
+      firstName: firstName?.trim() || existing?.firstName || cleanEmail.split("@")[0],
+      lastName: lastName?.trim() || existing?.lastName || "",
+      email: cleanEmail,
+      birthYear: existing?.birthYear || "2000",
+      interests: existing?.interests || [],
+      favoriteTopics: existing?.favoriteTopics || [],
+      bio: existing?.bio || "Google orqali tasdiqlangan hisob",
+      learnedPreferences: existing?.learnedPreferences || [],
+      avatar: avatar || existing?.avatar,
+      isGoogleUser: true,
+    };
+
+    users[cleanEmail] = {
+      profile: userProfile,
+      passwordHash: users[cleanEmail]?.passwordHash || `GOOGLE_AUTH_${googleId || Date.now()}`,
+    };
+    saveUsers(users);
+
+    // Ensure this user has at least one personalized chat session
+    const userSessions = Array.from(memoryStore.values()).filter(s => s.userEmail?.toLowerCase() === cleanEmail);
+    if (userSessions.length === 0) {
+      const initialId = `session-${Date.now()}`;
+      const newSession: ChatSession = {
+        id: initialId,
+        title: "UZUNITED AI Boshlang'ich Suhbat",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        userEmail: cleanEmail,
+        messages: [
+          {
+            id: `msg-${Date.now()}`,
+            role: "assistant",
+            content: `Assalomu alaykum, **${userProfile.firstName}**! 🎉 Google hisobingiz (${cleanEmail}) orqali muvaffaqiyatli kirdingiz.\n\nMen **UZUNITED AI** man. Endi barcha suhbatlaringiz, eslab qolingan mavzular va chat tarixingiz faqat sizning shaxsiy profilingizda xavfsiz saqlanadi. Qanday savolingiz bor yoki nima haqida suhbatlashamiz? 😊`,
+            timestamp: new Date().toISOString(),
+          }
+        ],
+        entityMemory: {},
+      };
+      memoryStore.set(initialId, newSession);
+      saveSessions(memoryStore);
+    }
+
+    res.json({ success: true, user: userProfile });
+  } catch (err: any) {
+    console.error("Google Auth backend error:", err);
+    res.status(500).json({ error: "Google orqali kirishda server xatoligi: " + err.message });
+  }
+});
+
 app.post("/api/auth/logout", (req, res) => {
-  saveActiveUser(null);
   res.json({ success: true });
 });
 
@@ -1607,24 +1688,13 @@ app.post("/api/search", async (req, res) => {
   }
 });
 
-// 4. Memory Sessions list (partitioned by user email)
+// 4. Memory Sessions list (strictly isolated by user email)
 app.get("/api/memory/sessions", (req, res) => {
-  const queryEmail = (req.query.email as string)?.trim().toLowerCase();
-  const activeUser = loadActiveUser();
-  const targetEmail = queryEmail || activeUser?.email?.trim().toLowerCase();
-
+  const queryEmail = (req.query.email as string || (req.headers["x-user-email"] as string))?.trim().toLowerCase();
   const sessions = Array.from(memoryStore.values());
 
-  if (targetEmail) {
-    // If default session has no email, associate with this user
-    for (const s of sessions) {
-      if (!s.userEmail && s.id === defaultSessionId) {
-        s.userEmail = targetEmail;
-      }
-    }
-    saveSessions(memoryStore);
-
-    let userSessions = sessions.filter(s => s.userEmail?.toLowerCase() === targetEmail);
+  if (queryEmail) {
+    let userSessions = sessions.filter(s => s.userEmail?.toLowerCase() === queryEmail);
 
     // If user has no sessions yet, create an initial personalized session for them
     if (userSessions.length === 0) {
@@ -1634,12 +1704,12 @@ app.get("/api/memory/sessions", (req, res) => {
         title: "UZUNITED AI Suhbat",
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-        userEmail: targetEmail,
+        userEmail: queryEmail,
         messages: [
           {
             id: `msg-${Date.now()}`,
             role: "assistant",
-            content: `Assalomu alaykum! Men **UZUNITED AI** man. Ushbu emailingiz (${targetEmail}) bo'yicha barcha suhbatlarimiz xavfsiz va to'liq saqlanadi. Qanday savolingiz bor yoki nima haqida gaplashamiz? 😊`,
+            content: `Assalomu alaykum! Men **UZUNITED AI** man. Ushbu emailingiz (${queryEmail}) bo'yicha barcha suhbatlarimiz xavfsiz va shaxsiy saqlanadi. Qanday savolingiz bor yoki nima haqida gaplashamiz? 😊`,
             timestamp: new Date().toISOString(),
           }
         ],
@@ -1663,24 +1733,25 @@ app.get("/api/memory/sessions", (req, res) => {
     return res.json({ sessions: list });
   }
 
-  const list = sessions.map(s => ({
+  // Unauthenticated guest session list: only sessions without userEmail
+  const guestSessions = sessions.filter(s => !s.userEmail);
+  const list = guestSessions.map(s => ({
     id: s.id,
     title: s.title,
     messageCount: s.messages.length,
     createdAt: s.createdAt,
     updatedAt: s.updatedAt,
-    userEmail: s.userEmail,
+    userEmail: undefined,
     lastEntity: s.entityMemory?.lastEntity || null,
   })).sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+
   res.json({ sessions: list });
 });
 
 // 4b. Get specific session
 app.get("/api/memory/sessions/:id", (req, res) => {
   const { id } = req.params;
-  const queryEmail = (req.query.email as string)?.trim().toLowerCase();
-  const activeUser = loadActiveUser();
-  const targetEmail = queryEmail || activeUser?.email?.trim().toLowerCase();
+  const queryEmail = (req.query.email as string || (req.headers["x-user-email"] as string))?.trim().toLowerCase();
 
   let session = memoryStore.get(id);
   if (!session) {
@@ -1689,14 +1760,14 @@ app.get("/api/memory/sessions/:id", (req, res) => {
       title: "Yangi suhbat",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      userEmail: targetEmail || undefined,
+      userEmail: queryEmail || undefined,
       messages: [],
       entityMemory: {},
     };
     memoryStore.set(id, session);
     saveSessions(memoryStore);
-  } else if (!session.userEmail && targetEmail) {
-    session.userEmail = targetEmail;
+  } else if (!session.userEmail && queryEmail) {
+    session.userEmail = queryEmail;
     saveSessions(memoryStore);
   }
   res.json({ session });
@@ -1706,8 +1777,7 @@ app.get("/api/memory/sessions/:id", (req, res) => {
 app.post("/api/memory/sessions/:id/sync", (req, res) => {
   const { id } = req.params;
   const { messages, title, email, userEmail } = req.body;
-  const activeUser = loadActiveUser();
-  const targetEmail = (email || userEmail || activeUser?.email)?.toString().trim().toLowerCase();
+  const targetEmail = (email || userEmail || (req.headers["x-user-email"] as string))?.toString().trim().toLowerCase();
 
   let session = memoryStore.get(id);
   if (!session) {
@@ -1750,9 +1820,7 @@ app.delete("/api/memory/sessions/:id", (req, res) => {
 
 // 5. Clear or create new session
 app.post("/api/memory/new-session", (req, res) => {
-  const reqEmail = (req.body?.email || req.body?.userEmail || req.query?.email as string)?.toString().trim().toLowerCase();
-  const activeUser = loadActiveUser();
-  const targetEmail = reqEmail || activeUser?.email?.trim().toLowerCase();
+  const reqEmail = (req.body?.email || req.body?.userEmail || req.query?.email as string || (req.headers["x-user-email"] as string))?.toString().trim().toLowerCase();
 
   const newId = `session-${Date.now()}`;
   const newSession: ChatSession = {
@@ -1760,7 +1828,7 @@ app.post("/api/memory/new-session", (req, res) => {
     title: "Yangi suhbat",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    userEmail: targetEmail || undefined,
+    userEmail: reqEmail || undefined,
     messages: [
       {
         id: `msg-${Date.now()}`,

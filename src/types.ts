@@ -49,6 +49,8 @@ export interface UserProfile {
   favoriteTopics?: string[]; // Yoqtirgan mavzulari
   bio?: string; // Qisqa ma'lumot
   learnedPreferences?: string[]; // AI muloqot davomida aniqlab eslab qolgan shaxsiy qiziqishlar
+  avatar?: string; // Google avatar yoki profil rasmi
+  isGoogleUser?: boolean; // Google orqali kiritilgan akkaunt
 }
 
 export interface IntentInfo {

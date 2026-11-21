@@ -85,12 +85,25 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
         <div className="p-5 space-y-4 overflow-y-auto flex-1">
           {/* Avatar and name */}
           <div className="flex flex-col items-center text-center">
-            <div className="w-16 h-16 rounded-full bg-gradient-to-tr from-blue-600 to-teal-400 text-white flex items-center justify-center text-2xl font-black shadow-md mb-2">
-              {user?.firstName ? user.firstName.charAt(0).toUpperCase() : 'U'}
+            <div className="w-16 h-16 rounded-full bg-gradient-to-tr from-blue-600 to-teal-400 text-white flex items-center justify-center text-2xl font-black shadow-md mb-2 overflow-hidden ring-2 ring-blue-500/30">
+              {user?.avatar ? (
+                <img src={user.avatar} alt={user.firstName} className="w-full h-full object-cover" />
+              ) : user?.firstName ? (
+                user.firstName.charAt(0).toUpperCase()
+              ) : (
+                'U'
+              )}
             </div>
-            <h4 className="font-bold text-slate-900 text-base">
-              {user ? `${user.firstName} ${user.lastName}` : 'Foydalanuvchi'}
-            </h4>
+            <div className="flex items-center gap-1.5 justify-center">
+              <h4 className="font-bold text-slate-900 text-base">
+                {user ? `${user.firstName} ${user.lastName}` : 'Foydalanuvchi'}
+              </h4>
+              {user?.isGoogleUser && (
+                <span className="text-[10px] px-2 py-0.5 bg-blue-100 text-blue-700 font-bold rounded-full">
+                  Google
+                </span>
+              )}
+            </div>
             <span className="text-xs text-slate-500">{user?.email || 'foydalanuvchi@ai.uz'}</span>
           </div>
 

@@ -8,8 +8,10 @@ import { ArchitectureViewer } from './components/ArchitectureViewer';
 import { CodebaseExplorer } from './components/CodebaseExplorer';
 import { LocalLLMComparison } from './components/LocalLLMComparison';
 import { MemoryInspector } from './components/MemoryInspector';
+import { WebGPUModal } from './components/WebGPUModal';
 import { ChatMessage, ChatSession, UserProfile, FileAttachment } from './types';
 import { generateClientResponse } from './utils/clientAiEngine';
+import { getActiveWebLLMEngine, streamWebLLMCompletion } from './utils/webLlmEngine';
 
 export default function App() {
   const [user, setUser] = useState<UserProfile | null>(() => {
@@ -24,7 +26,17 @@ export default function App() {
   const [currentTab, setCurrentTab] = useState<AppTabType>('chat');
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [desktopSidebarOpen, setDesktopSidebarOpen] = useState(true);
+  const [isPrivateChat, setIsPrivateChat] = useState(false);
   const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
+  const [isWebGPUModalOpen, setIsWebGPUModalOpen] = useState(false);
+  const [isWebGPUActive, setIsWebGPUActive] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('uzunited_webgpu_active') === 'true';
+    } catch {
+      return false;
+    }
+  });
 
   const [selectedModel, setSelectedModel] = useState('UZUNITED AI v1.0');
   const [tokenCount, setTokenCount] = useState(842);
@@ -82,10 +94,18 @@ export default function App() {
     }
   };
 
-  // Fetch active user profile from server for true cross-session persistence
+  // Fetch user profile from server for true cross-session persistence
   const fetchUserProfile = async () => {
     try {
-      const res = await fetch('/api/user/profile');
+      const savedUserStr = localStorage.getItem('uzunited_user');
+      if (!savedUserStr) {
+        return;
+      }
+      const localUser = JSON.parse(savedUserStr);
+      if (!localUser?.email) {
+        return;
+      }
+      const res = await fetch(`/api/user/profile?email=${encodeURIComponent(localUser.email)}`);
       if (res.ok) {
         const data = await res.json();
         if (data.user) {
@@ -117,6 +137,19 @@ export default function App() {
     } else {
       fetchSessions('', true);
     }
+  }, [user?.email]);
+
+  // Global Cmd+K / Ctrl+K shortcut for new chat
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setCurrentTab('chat');
+        handleNewChat();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
   }, [user?.email]);
 
   // Send message handler supporting attachments
@@ -151,6 +184,74 @@ export default function App() {
     }
     steps.push(`2. Butun dunyo bilimlari va kontekst xotirasi tahlilga tortilmoqda...`);
     setActiveReasoningSteps(steps);
+
+    // In-Browser WebGPU AI Execution (0 API Key mode)
+    const activeWebEngine = getActiveWebLLMEngine();
+    if (isWebGPUActive && activeWebEngine) {
+      const assistantMsgId = `msg-${Date.now()}-webgpu`;
+      const placeholderAssistantMsg: ChatMessage = {
+        id: assistantMsgId,
+        role: 'assistant',
+        content: '',
+        timestamp: new Date().toISOString(),
+      };
+      setMessages(prev => [...prev, placeholderAssistantMsg]);
+      setActiveReasoningSteps([
+        `1. Foydalanuvchi so'rovi qabul qilindi: "${effectiveContent}"`,
+        `2. ⚡ Brauzer WebGPU neyrotarmog'i ishga tushirildi (0 API Kalitsiz, lokal hisob-kitob)...`,
+      ]);
+
+      try {
+        const conversationHistory = messages.slice(-6).map(m => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content,
+        }));
+        conversationHistory.push({ role: 'user', content: effectiveContent });
+
+        const systemInstruction = {
+          role: 'system' as const,
+          content: `Siz "UZUNITED AI" — foydalanuvchi qurilmasida WebGPU yordamida ishlaydigan aqlli, samimiy va erkin sun'iy intellektsiz. O'zbek tilida insondek samimiy, lo'nda va tabiiy javob bering. Foydalanuvchining ismi: ${user?.firstName || 'do‘stim'}.`,
+        };
+
+        let generatedText = '';
+        await streamWebLLMCompletion(
+          activeWebEngine,
+          [systemInstruction, ...conversationHistory],
+          (_token, accumulated) => {
+            generatedText = accumulated;
+            setMessages(prev =>
+              prev.map(m => (m.id === assistantMsgId ? { ...m, content: accumulated } : m))
+            );
+          }
+        );
+
+        setActiveReasoningSteps([
+          `1. Foydalanuvchi so'rovi: "${effectiveContent}"`,
+          `2. ⚡ WebGPU: 0 API Kalitsiz to'liq lokal neyrotarmoq hisoblandi.`,
+          `3. Javob muvaffaqiyatli yetkazildi.`,
+        ]);
+        setTokenCount(prev => prev + Math.floor(generatedText.length / 3));
+
+        // Save session history permanently partitioned by user email
+        const updatedMsgs = [...messages, userMsg, { ...placeholderAssistantMsg, content: generatedText }];
+        fetch(`/api/memory/sessions/${sessionId}/sync`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: updatedMsgs,
+            email: user?.email,
+            userEmail: user?.email,
+            title: effectiveContent.slice(0, 30) + (effectiveContent.length > 30 ? '...' : ''),
+          }),
+        }).then(() => fetchSessions(user?.email)).catch(() => {});
+
+        setIsLoading(false);
+        return;
+      } catch (gpuErr: any) {
+        console.warn("WebGPU generation failed, falling back to server:", gpuErr);
+        setMessages(prev => prev.filter(m => m.id !== assistantMsgId));
+      }
+    }
 
     try {
       const executeRequest = async (isRetry = false): Promise<any> => {
@@ -335,6 +436,14 @@ export default function App() {
     localStorage.setItem('uzunited_user', JSON.stringify(authenticatedUser));
     setIsAuthModalOpen(false);
     fetchSessions(authenticatedUser.email, true);
+    setMessages([
+      {
+        id: `msg-${Date.now()}`,
+        role: 'assistant',
+        content: `Assalomu alaykum, **${authenticatedUser.firstName}**! 🎉\n\nMen **UZUNITED AI** man. Suhbatlaringiz va eslab qolingan mavzular profilingiz (${authenticatedUser.email}) bilan muvaffaqiyatli bog'landi. Qanday savolingiz bor yoki nima haqida suhbatlashamiz? 😊`,
+        timestamp: new Date().toISOString(),
+      }
+    ]);
   };
 
   // User profile update
@@ -355,98 +464,147 @@ export default function App() {
   const handleLogout = async () => {
     localStorage.removeItem('uzunited_user');
     setUser(null);
+    setSessions([]);
+    const guestId = `session-${Date.now()}`;
+    setSessionId(guestId);
+    setMessages([
+      {
+        id: 'msg-0',
+        role: 'assistant',
+        content: "Salom! Men **UZUNITED AI** man — universal sun'iy intellekt yordamchingiz. Qanday mavzuda suhbatlashamiz yoki qanday savolingiz bor?",
+        timestamp: new Date().toISOString(),
+      }
+    ]);
     try {
       await fetch('/api/auth/logout', { method: 'POST' });
     } catch {}
     setIsAuthModalOpen(true);
   };
 
+  const handleOpenProfileOrAuth = () => {
+    if (user) {
+      setIsProfileModalOpen(true);
+    } else {
+      setIsAuthModalOpen(true);
+    }
+  };
+
+  const handleTogglePrivateChat = () => {
+    setIsPrivateChat((prev) => {
+      const next = !prev;
+      if (next) {
+        const privId = `private-${Date.now()}`;
+        setSessionId(privId);
+        setMessages([
+          {
+            id: `msg-${Date.now()}`,
+            role: 'assistant',
+            content: "Shaxsiy suhbat rejimi faollashdi. Bu suhbat maxfiy tarzda olib boriladi.",
+            timestamp: new Date().toISOString(),
+          },
+        ]);
+        setActiveReasoningSteps([]);
+      } else {
+        handleNewChat();
+      }
+      return next;
+    });
+  };
+
   return (
-    <div className="h-screen flex flex-col bg-[#f8fafc] text-slate-900 overflow-hidden font-sans select-text">
-      
-      {/* Top Header matching screenshot */}
-      <Header
-        onOpenMenu={() => setIsSidebarOpen(true)}
-        onNewChat={handleNewChat}
-        onOpenProfile={() => {
-          if (user) {
-            setIsProfileModalOpen(true);
-          } else {
-            setIsAuthModalOpen(true);
-          }
-        }}
-        selectedModel={selectedModel}
-        onSelectModel={setSelectedModel}
-        user={user}
-        tokenCount={tokenCount}
-        currentTab={currentTab}
-        onSelectTab={setCurrentTab}
-      />
-
-      {/* Main Multi-Module Viewport */}
-      <main className="flex-1 flex flex-col overflow-hidden">
-        {currentTab === 'chat' && (
-          <ChatInterface
-            messages={messages}
-            onSendMessage={handleSendMessage}
-            isLoading={isLoading}
-            activeReasoningSteps={activeReasoningSteps}
-            onNewSession={handleNewChat}
-            selectedModel={selectedModel}
-            user={user}
-            onOpenProfile={() => setIsProfileModalOpen(true)}
-          />
-        )}
-
-        {currentTab === 'architecture' && (
-          <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
-            <ArchitectureViewer />
-          </div>
-        )}
-
-        {currentTab === 'codebase' && (
-          <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
-            <CodebaseExplorer />
-          </div>
-        )}
-
-        {currentTab === 'models' && (
-          <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
-            <LocalLLMComparison />
-          </div>
-        )}
-
-        {currentTab === 'memory' && (
-          <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
-            <MemoryInspector
-              sessions={sessions}
-              currentSessionId={sessionId}
-              messages={messages}
-              onClearSession={handleNewChat}
-            />
-          </div>
-        )}
-      </main>
-
-      {/* Slide-out Sidebar Drawer with Chat History and individual delete buttons */}
+    <div className="h-screen flex bg-white text-slate-900 overflow-hidden font-sans select-text">
+      {/* Persistent Desktop Sidebar + Mobile Slide-Over Drawer */}
       <SidebarDrawer
         isOpen={isSidebarOpen}
         onClose={() => setIsSidebarOpen(false)}
+        desktopOpen={desktopSidebarOpen}
+        onToggleDesktop={() => setDesktopSidebarOpen((prev) => !prev)}
         sessions={sessions}
         currentSessionId={sessionId}
         onSelectSession={handleSelectSession}
         onNewChat={handleNewChat}
         onDeleteSession={handleDeleteSession}
         user={user}
-        onLogout={handleLogout}
+        onOpenProfile={handleOpenProfileOrAuth}
+        onOpenWebGPUModal={() => setIsWebGPUModalOpen(true)}
         currentTab={currentTab}
         onSelectTab={setCurrentTab}
       />
 
-      {/* Registration & Login Modal on first entrance */}
+      {/* Right Main Area */}
+      <div className="flex-1 flex flex-col min-w-0 h-full bg-white">
+        <Header
+          onOpenMenu={() => setIsSidebarOpen(true)}
+          desktopSidebarOpen={desktopSidebarOpen}
+          onToggleDesktopSidebar={() => setDesktopSidebarOpen((prev) => !prev)}
+          onNewChat={handleNewChat}
+          onOpenProfile={handleOpenProfileOrAuth}
+          selectedModel={selectedModel}
+          onSelectModel={setSelectedModel}
+          user={user}
+          tokenCount={tokenCount}
+          currentTab={currentTab}
+          onSelectTab={setCurrentTab}
+          isWebGPUActive={isWebGPUActive}
+          onOpenWebGPUModal={() => setIsWebGPUModalOpen(true)}
+          isPrivateChat={isPrivateChat}
+          onTogglePrivateChat={handleTogglePrivateChat}
+        />
+
+        {/* Main Multi-Module Viewport */}
+        <main className="flex-1 flex flex-col overflow-hidden bg-white">
+          {currentTab === 'chat' && (
+            <ChatInterface
+              messages={messages}
+              onSendMessage={handleSendMessage}
+              isLoading={isLoading}
+              activeReasoningSteps={activeReasoningSteps}
+              onNewSession={handleNewChat}
+              selectedModel={selectedModel}
+              user={user}
+              isWebGPUActive={isWebGPUActive}
+              onOpenWebGPUModal={() => setIsWebGPUModalOpen(true)}
+              isPrivateChat={isPrivateChat}
+              onTogglePrivateChat={handleTogglePrivateChat}
+            />
+          )}
+
+          {currentTab === 'architecture' && (
+            <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
+              <ArchitectureViewer />
+            </div>
+          )}
+
+          {currentTab === 'codebase' && (
+            <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
+              <CodebaseExplorer />
+            </div>
+          )}
+
+          {currentTab === 'models' && (
+            <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
+              <LocalLLMComparison onOpenWebGPU={() => setIsWebGPUModalOpen(true)} />
+            </div>
+          )}
+
+          {currentTab === 'memory' && (
+            <div className="flex-1 overflow-y-auto bg-slate-950 text-slate-100">
+              <MemoryInspector
+                sessions={sessions}
+                currentSessionId={sessionId}
+                messages={messages}
+                onClearSession={handleNewChat}
+              />
+            </div>
+          )}
+        </main>
+      </div>
+
+      {/* Registration & Login Modal */}
       <AuthModal
         isOpen={isAuthModalOpen}
         onSuccess={handleAuthSuccess}
+        onClose={() => setIsAuthModalOpen(false)}
       />
 
       {/* User Profile Modal */}
@@ -456,6 +614,19 @@ export default function App() {
         user={user}
         onUpdateUser={handleUpdateUser}
         onLogout={handleLogout}
+      />
+
+      {/* WebGPU In-Browser AI Modal (0 API Key) */}
+      <WebGPUModal
+        isOpen={isWebGPUModalOpen}
+        onClose={() => setIsWebGPUModalOpen(false)}
+        isWebGPUActive={isWebGPUActive}
+        onToggleWebGPUActive={(active) => {
+          setIsWebGPUActive(active);
+          try {
+            localStorage.setItem('uzunited_webgpu_active', active.toString());
+          } catch {}
+        }}
       />
 
     </div>

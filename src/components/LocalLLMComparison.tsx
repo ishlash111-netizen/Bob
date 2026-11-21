@@ -15,7 +15,11 @@ import {
 import { LOCAL_MODELS_DATA } from '../data/pythonCodebase';
 import { LocalModelInfo } from '../types';
 
-export const LocalLLMComparison: React.FC = () => {
+interface LocalLLMComparisonProps {
+  onOpenWebGPU?: () => void;
+}
+
+export const LocalLLMComparison: React.FC<LocalLLMComparisonProps> = ({ onOpenWebGPU }) => {
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [testingConnection, setTestingConnection] = useState(false);
   const [ollamaStatus, setOllamaStatus] = useState<{ connected: boolean; message?: string } | null>(null);
@@ -49,6 +53,36 @@ export const LocalLLMComparison: React.FC = () => {
 
   return (
     <div className="max-w-6xl mx-auto px-4 py-6 space-y-6">
+      {/* WebGPU Highlight Banner */}
+      <div className="p-5 rounded-3xl bg-gradient-to-r from-blue-900/60 via-indigo-950/70 to-purple-900/60 border border-blue-500/30 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-xl">
+        <div className="flex items-start sm:items-center gap-3">
+          <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white shadow-lg shadow-blue-500/20 flex-shrink-0">
+            <Zap className="w-6 h-6 fill-white" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h3 className="text-base font-bold text-white">Brauzer WebGPU AIsi (0 API Kalit)</h3>
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                FAOL
+              </span>
+            </div>
+            <p className="text-xs text-slate-300 mt-1">
+              Hech qanday tashqi API kalit, server yoki to‘lovsiz — neyrotarmoqni bevosita brauzeringiz xotirasida ishga tushiring!
+            </p>
+          </div>
+        </div>
+
+        {onOpenWebGPU && (
+          <button
+            onClick={onOpenWebGPU}
+            className="px-5 py-2.5 rounded-2xl bg-blue-500 hover:bg-blue-400 text-white font-bold text-xs sm:text-sm transition-all shadow-md flex items-center justify-center gap-2 flex-shrink-0 cursor-pointer"
+          >
+            <Zap className="w-4 h-4 fill-white" />
+            <span>Brauzerda Sinash</span>
+          </button>
+        )}
+      </div>
+
       {/* Title */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
