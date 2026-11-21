@@ -4,7 +4,7 @@ import { UserProfile } from '../types';
 
 interface AuthModalProps {
   isOpen: boolean;
-  onSuccess: (user: UserProfile) => void;
+  onSuccess: (user: UserProfile, token?: string) => void;
   onClose?: () => void;
 }
 
@@ -59,30 +59,21 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess, onClose
     }
   };
 
-  // Handle Google GIS response
+  // Handle Google GIS response (credential JWT verified on server)
   const handleGoogleCredentialResponse = async (response: any) => {
     try {
       setIsSubmitting(true);
       setError('');
       const credential = response.credential;
-      const payload = parseJwt(credential);
-
-      const targetEmail = payload?.email || '';
-      const targetFirst = payload?.given_name || payload?.name?.split(' ')[0] || 'Google Foydalanuvchi';
-      const targetLast = payload?.family_name || payload?.name?.split(' ').slice(1).join(' ') || '';
-      const avatar = payload?.picture || '';
 
       const res = await fetch('/api/auth/google', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          credential,
-          email: targetEmail,
-          firstName: targetFirst,
-          lastName: targetLast,
-          avatar,
-          googleId: payload?.sub,
-        }),
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({ credential }),
       });
 
       const data = await res.json();
@@ -90,17 +81,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess, onClose
         throw new Error(data.error || "Google orqali kirishda xatolik yuz berdi");
       }
 
-      const user: UserProfile = data.user || {
-        firstName: targetFirst,
-        lastName: targetLast,
-        email: targetEmail.toLowerCase(),
-        birthYear: '2000',
-        avatar,
-        isGoogleUser: true,
-      };
-
-      localStorage.setItem('uzunited_user', JSON.stringify(user));
-      onSuccess(user);
+      onSuccess(data.user, data.token);
     } catch (err: any) {
       console.error("Google Auth error:", err);
       setError(err.message || "Google orqali ulanishda xatolik yuz berdi.");
@@ -205,36 +186,22 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess, onClose
 
             if (tokenResponse?.access_token) {
               try {
-                const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-                  headers: {
-                    Authorization: `Bearer ${tokenResponse.access_token}`,
-                  },
-                });
-
-                if (!userInfoRes.ok) {
-                  throw new Error("Google profil ma'lumotlarini yuklab bo'lmadi");
-                }
-
-                const googleProfile = await userInfoRes.json();
-
                 const res = await fetch('/api/auth/google', {
                   method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
+                  credentials: 'include',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                  },
                   body: JSON.stringify({
-                    email: googleProfile.email,
-                    firstName: googleProfile.given_name || googleProfile.name?.split(' ')[0] || 'Google Foydalanuvchi',
-                    lastName: googleProfile.family_name || googleProfile.name?.split(' ').slice(1).join(' ') || '',
-                    avatar: googleProfile.picture || '',
-                    googleId: googleProfile.sub,
+                    accessToken: tokenResponse.access_token,
                   }),
                 });
 
                 const data = await res.json();
                 if (!res.ok) throw new Error(data.error || "Google orqali kirishda xatolik yuz berdi");
 
-                const user: UserProfile = data.user;
-                localStorage.setItem('uzunited_user', JSON.stringify(user));
-                onSuccess(user);
+                onSuccess(data.user, data.token);
               } catch (err: any) {
                 console.error("Google profile sync error:", err);
                 setError(err.message || "Google hisobini ulab bo'lmadi");
@@ -274,39 +241,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess, onClose
     setShowOriginHelper(true);
   };
 
-  // Quick Google direct email connect (fallback if Google Cloud origins are not yet configured for current domain)
-  const handleDirectGoogleEmail = async (userEnteredEmail: string) => {
-    const clean = userEnteredEmail.trim().toLowerCase();
-    if (!clean || !clean.includes('@')) {
-      setError("To'g'ri Google email manzilini kiriting.");
-      return;
-    }
-    setIsSubmitting(true);
-    setError('');
-    try {
-      const res = await fetch('/api/auth/google', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: clean,
-          firstName: clean.split('@')[0],
-          lastName: '',
-          avatar: `https://www.gravatar.com/avatar/${Math.random().toString(36)}?d=identicon`,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-
-      const user: UserProfile = data.user;
-      localStorage.setItem('uzunited_user', JSON.stringify(user));
-      onSuccess(user);
-    } catch (err: any) {
-      setError(err.message || "Google hisobini bog'lashda xatolik yuz berdi");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
@@ -338,7 +272,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess, onClose
       try {
         const res = await fetch('/api/auth/register', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
           body: JSON.stringify({
             firstName: firstName.trim(),
             lastName: lastName.trim(),
@@ -352,26 +290,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess, onClose
           throw new Error(data.error || "Ro'yxatdan o'tishda xatolik yuz berdi");
         }
 
-        const registeredUser: UserProfile = data.user || {
-          firstName: firstName.trim(),
-          lastName: lastName.trim(),
-          email: email.trim().toLowerCase(),
-          birthYear,
-        };
-
-        localStorage.setItem('uzunited_user', JSON.stringify(registeredUser));
-        localStorage.setItem(`uzunited_pwd_${registeredUser.email}`, password);
-        onSuccess(registeredUser);
+        onSuccess(data.user, data.token);
       } catch (err: any) {
-        const newUser: UserProfile = {
-          firstName: firstName.trim(),
-          lastName: lastName.trim(),
-          email: email.trim().toLowerCase(),
-          birthYear,
-        };
-        localStorage.setItem('uzunited_user', JSON.stringify(newUser));
-        localStorage.setItem(`uzunited_pwd_${newUser.email}`, password);
-        onSuccess(newUser);
+        setError(err.message || "Ro'yxatdan o'tishda xatolik yuz berdi.");
       } finally {
         setIsSubmitting(false);
       }
@@ -381,7 +302,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess, onClose
       try {
         const res = await fetch('/api/auth/login', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
           body: JSON.stringify({
             email: email.trim().toLowerCase(),
             password,
@@ -390,22 +315,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess, onClose
         const data = await res.json();
         if (!res.ok) {
           setError(data.error || "Kirishda xatolik yuz berdi");
-          setIsSubmitting(false);
           return;
         }
 
-        const loggedInUser: UserProfile = data.user;
-        localStorage.setItem('uzunited_user', JSON.stringify(loggedInUser));
-        onSuccess(loggedInUser);
+        onSuccess(data.user, data.token);
       } catch (err: any) {
-        const user: UserProfile = {
-          firstName: email.split('@')[0],
-          lastName: '',
-          email: email.trim().toLowerCase(),
-          birthYear: '2000',
-        };
-        localStorage.setItem('uzunited_user', JSON.stringify(user));
-        onSuccess(user);
+        setError(err.message || "Tizimga kirishda xatolik yuz berdi.");
       } finally {
         setIsSubmitting(false);
       }
@@ -514,7 +429,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess, onClose
                   <span>Google Cloud ruxsatnomasi (Origin xatosi sababi):</span>
                 </div>
                 <p className="text-[10px] text-amber-800 leading-relaxed">
-                  Google Cloud Console-da sizning OAuth Client ID'ingizga joriy sayt manzili (Authorized JavaScript Origins) ro'yxatiga kiritilmagan bo'lsa, Google popup oynada "origin_mismatch" yoki "xatolik" deb chiqaradi. Sayt manzili:
+                  Google Cloud Console-da Authorized JavaScript Origins ro‘yxatiga joriy sayt manzili kiritilgan bo‘lishi kerak. Yoki pastdagi Email va parol orqali kirishdan foydalaning:
                 </p>
                 <div className="flex items-center gap-1.5 bg-white p-1.5 rounded-lg border border-amber-200">
                   <code className="text-[10px] text-slate-800 font-mono truncate flex-1">
@@ -528,33 +443,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onSuccess, onClose
                     {copiedOrigin ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
                     <span>{copiedOrigin ? "Nusxalandi" : "Nusxalash"}</span>
                   </button>
-                </div>
-                <div className="pt-1">
-                  <p className="text-[10px] font-medium text-amber-800 mb-1">
-                    Yoki emailingiz bilan bir zumda shaxsiy profilga kiring:
-                  </p>
-                  <div className="flex gap-1.5">
-                    <input
-                      type="email"
-                      placeholder="Google emailingiz (masalan: nom@gmail.com)"
-                      className="flex-1 px-2.5 py-1.5 text-xs bg-white border border-amber-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-500"
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          handleDirectGoogleEmail((e.target as HTMLInputElement).value);
-                        }
-                      }}
-                    />
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        const input = (e.currentTarget.previousElementSibling as HTMLInputElement);
-                        handleDirectGoogleEmail(input.value);
-                      }}
-                      className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold shrink-0"
-                    >
-                      Bog'lash
-                    </button>
-                  </div>
                 </div>
               </div>
             )}

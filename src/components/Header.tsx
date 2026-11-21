@@ -59,7 +59,7 @@ export const Header: React.FC<HeaderProps> = ({
     : models.find((m) => m.id === selectedModel) || models[0];
 
   return (
-    <header className="w-full bg-white sticky top-0 z-30 select-none">
+    <header className="w-full shrink-0 bg-white z-30 select-none">
       {/* Desktop Top Bar */}
       <div className="hidden md:flex items-center justify-between h-14 px-5">
         <div className="flex items-center gap-2">

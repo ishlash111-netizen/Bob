@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Plus,
   Search,
@@ -58,6 +58,32 @@ export const SidebarDrawer: React.FC<SidebarDrawerProps> = ({
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [projectsExpanded, setProjectsExpanded] = useState(false);
+  const [actionSessionId, setActionSessionId] = useState<string | null>(null);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const didLongPressRef = useRef(false);
+  const pressStartRef = useRef<{ x: number; y: number } | null>(null);
+
+  const clearLongPressTimer = () => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    if (!actionSessionId) return;
+    const handleDismiss = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setActionSessionId(null);
+    };
+    window.addEventListener('keydown', handleDismiss);
+    return () => {
+      window.removeEventListener('keydown', handleDismiss);
+    };
+  }, [actionSessionId]);
+
+  useEffect(() => {
+    return () => clearLongPressTimer();
+  }, []);
 
   const groupedSessions = useMemo(() => {
     const filtered = sessions.filter((s) => {
@@ -89,9 +115,9 @@ export const SidebarDrawer: React.FC<SidebarDrawerProps> = ({
   }, [sessions, searchQuery]);
 
   const renderSidebarBody = (isMobile: boolean) => (
-    <div className="flex flex-col h-full bg-[#fcfcfd] text-slate-900 select-none">
+    <div className="flex flex-col h-full min-h-0 bg-[#fcfcfd] text-slate-900 select-none overflow-hidden">
       {/* Top Brand + Collapse Icon */}
-      <div className="px-4 pt-4 pb-3 flex items-center justify-between">
+      <div className="px-4 pt-4 pb-3 flex items-center justify-between shrink-0">
         <button
           type="button"
           onClick={() => {
@@ -118,7 +144,7 @@ export const SidebarDrawer: React.FC<SidebarDrawerProps> = ({
       </div>
 
       {/* Primary CTA: + Yangi suhbat ⌘K */}
-      <div className="px-3.5 pb-3">
+      <div className="px-3.5 pb-3 shrink-0">
         <button
           id={isMobile ? 'btn-new-chat-drawer' : 'btn-new-chat-sidebar'}
           type="button"
@@ -140,7 +166,7 @@ export const SidebarDrawer: React.FC<SidebarDrawerProps> = ({
       </div>
 
       {/* Search & Projects Navigation */}
-      <div className="px-3 space-y-0.5 pb-3">
+      <div className="px-3 space-y-0.5 pb-3 shrink-0">
         {searchOpen ? (
           <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-white border border-slate-200 focus-within:border-violet-400">
             <Search className="w-4 h-4 text-slate-400 shrink-0" />
@@ -231,7 +257,7 @@ export const SidebarDrawer: React.FC<SidebarDrawerProps> = ({
       </div>
 
       {/* Scrollable Chat History Grouped by BUGUN / KECHA / OLDIN */}
-      <div className="flex-1 overflow-y-auto px-3 space-y-5 pb-4 no-scrollbar">
+      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-3 space-y-5 pb-4 no-scrollbar">
         {[
           { label: 'BUGUN', items: groupedSessions.today },
           { label: 'KECHA', items: groupedSessions.yesterday },
@@ -246,35 +272,115 @@ export const SidebarDrawer: React.FC<SidebarDrawerProps> = ({
                 <div className="space-y-0.5">
                   {group.items.map((sess) => {
                     const isActive = sess.id === currentSessionId && currentTab === 'chat';
+                    const isMenuOpen = actionSessionId === sess.id;
                     return (
-                      <div
-                        key={sess.id}
-                        onClick={() => {
-                          onSelectSession(sess.id);
-                          onSelectTab?.('chat');
-                          if (isMobile) onClose();
-                        }}
-                        className={`group flex items-center justify-between px-2.5 py-2 rounded-xl text-[13px] transition-colors cursor-pointer ${
-                          isActive
-                            ? 'bg-slate-100 text-slate-900 font-medium'
-                            : 'text-slate-700 hover:bg-slate-100/70'
-                        }`}
-                      >
-                        <span className="truncate pr-2">
-                          {sess.title || 'Yangi suhbat'}
-                        </span>
-                        <button
-                          id={`btn-delete-session-${sess.id}`}
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onDeleteSession(sess.id);
+                      <div key={sess.id} className="relative">
+                        <div
+                          onPointerDown={(e) => {
+                            if (e.button !== 0 && e.pointerType === 'mouse') return;
+                            didLongPressRef.current = false;
+                            pressStartRef.current = { x: e.clientX, y: e.clientY };
+                            clearLongPressTimer();
+                            longPressTimerRef.current = setTimeout(() => {
+                              didLongPressRef.current = true;
+                              setActionSessionId(sess.id);
+                            }, 420);
                           }}
-                          title="Suhbatni o‘chirish"
-                          className="p-1 rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity shrink-0 cursor-pointer"
+                          onPointerUp={() => {
+                            pressStartRef.current = null;
+                            clearLongPressTimer();
+                          }}
+                          onPointerCancel={() => {
+                            pressStartRef.current = null;
+                            clearLongPressTimer();
+                          }}
+                          onPointerMove={(e) => {
+                            if (!pressStartRef.current) return;
+                            if (Math.hypot(e.clientX - pressStartRef.current.x, e.clientY - pressStartRef.current.y) > 10) {
+                              pressStartRef.current = null;
+                              clearLongPressTimer();
+                            }
+                          }}
+                          onContextMenu={(e) => {
+                            e.preventDefault();
+                            setActionSessionId(sess.id);
+                          }}
+                          onClick={() => {
+                            if (didLongPressRef.current) {
+                              didLongPressRef.current = false;
+                              return;
+                            }
+                            if (isMenuOpen) {
+                              setActionSessionId(null);
+                              return;
+                            }
+                            onSelectSession(sess.id);
+                            onSelectTab?.('chat');
+                            if (isMobile) onClose();
+                          }}
+                          className={`group flex items-center justify-between gap-1 px-2.5 py-2 rounded-xl text-[13px] transition-colors cursor-pointer select-none ${
+                            isMenuOpen
+                              ? 'bg-red-50/70 text-slate-900 ring-1 ring-red-200'
+                              : isActive
+                                ? 'bg-slate-100 text-slate-900 font-medium'
+                                : 'text-slate-700 hover:bg-slate-100/70'
+                          }`}
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                          <span className="truncate pr-1 flex-1">
+                            {sess.title || 'Yangi suhbat'}
+                          </span>
+
+                          {isMenuOpen ? (
+                            <div
+                              className="flex items-center gap-1 shrink-0"
+                              onClick={(e) => e.stopPropagation()}
+                              onPointerDown={(e) => e.stopPropagation()}
+                            >
+                              <button
+                                id={`btn-delete-session-${sess.id}`}
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setActionSessionId(null);
+                                  onDeleteSession(sess.id);
+                                }}
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-semibold shadow-2xs transition-colors cursor-pointer"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                                <span>O‘chirish</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setActionSessionId(null);
+                                }}
+                                title="Bekor qilish"
+                                className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-white transition-colors cursor-pointer"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              id={`btn-session-options-${sess.id}`}
+                              type="button"
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setActionSessionId(sess.id);
+                              }}
+                              title="Suhbatni o‘chirish"
+                              className={`p-1 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-200/70 transition-opacity shrink-0 cursor-pointer ${
+                                isActive
+                                  ? 'opacity-100'
+                                  : 'opacity-70 md:opacity-0 md:group-hover:opacity-100 md:focus:opacity-100'
+                              }`}
+                            >
+                              <MoreHorizontal className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
                       </div>
                     );
                   })}
@@ -291,7 +397,7 @@ export const SidebarDrawer: React.FC<SidebarDrawerProps> = ({
       </div>
 
       {/* Bottom Pro Upgrade Card & Account Footer */}
-      <div className="px-3.5 pb-3.5 pt-2 space-y-3 bg-[#fcfcfd]">
+      <div className="px-3.5 pb-3.5 pt-2 space-y-3 bg-[#fcfcfd] shrink-0">
         {/* Ko'proq imkoniyat card matching design */}
         <div className="p-3.5 rounded-2xl bg-[#F4EFFF] border border-violet-100/80">
           <div className="flex items-center gap-1.5 text-slate-900 font-semibold text-[13px]">

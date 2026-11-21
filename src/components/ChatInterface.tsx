@@ -589,7 +589,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
 
   return (
     <div
-      className={`flex-1 flex flex-col h-full bg-white text-slate-900 relative overflow-hidden ${
+      className={`flex-1 min-h-0 flex flex-col h-full bg-white text-slate-900 relative overflow-hidden ${
         isDragging ? 'ring-4 ring-violet-500/25' : ''
       }`}
       onDragOver={handleDragOver}
@@ -655,124 +655,126 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
 
       {isWelcomeState ? (
         /* WELCOME HERO VIEW MATCHING BOTH PC & MOBILE SCREENSHOTS */
-        <div className="flex-1 flex flex-col overflow-y-auto px-4">
-          {/* Mobile centered Lock/Shaxsiy suhbat trigger matching mobile screenshot */}
-          <div className="flex md:hidden justify-center pt-1 pb-2">
-            <button
-              type="button"
-              onClick={onTogglePrivateChat}
-              className={`flex items-center gap-1.5 text-xs font-medium px-3 py-1 rounded-full transition-colors cursor-pointer ${
-                isPrivateChat
-                  ? 'bg-violet-50 text-[#6C38FF]'
-                  : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              <Lock className="w-3.5 h-3.5" />
-              <span>{isPrivateChat ? 'Shaxsiy rejim faol' : 'Shaxsiy suhbat'}</span>
-            </button>
-          </div>
-
-          <div className="flex-1 flex flex-col items-center justify-between md:justify-center max-w-[760px] w-full mx-auto py-3 md:py-8">
-            {/* Hero Brand + Headline + 4 Cards */}
-            <div className="w-full flex flex-col items-center my-auto md:my-0">
-              <AiBrandLogo size="lg" />
-
-              <h1 className="mt-5 text-[26px] sm:text-[32px] font-bold tracking-tight text-slate-900 text-center leading-[1.2] text-balance">
-                Bugun nimada yordam beray?
-              </h1>
-              <p className="mt-2 text-[13.5px] sm:text-[15px] text-slate-500 text-center max-w-md leading-relaxed">
-                G‘oyadan natijagacha — aqlli yordamchingiz yoningizda.
-              </p>
-
-              {/* 4 Suggestion Cards (2x2 Mobile, 4-col Desktop) */}
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 w-full mt-7">
-                {suggestionCards.map((card) => {
-                  const Icon = card.icon;
-                  return (
-                    <button
-                      key={card.title}
-                      type="button"
-                      onClick={() => {
-                        setInput(card.prompt);
-                        textareaRef.current?.focus();
-                      }}
-                      className="bg-white border border-slate-200/90 hover:border-violet-300 hover:shadow-sm rounded-2xl p-4 text-left transition-all flex flex-col items-start gap-3 cursor-pointer group"
-                    >
-                      <div
-                        className={`w-8 h-8 rounded-xl flex items-center justify-center ${card.iconBg}`}
-                      >
-                        <Icon className="w-4 h-4 stroke-[2]" />
-                      </div>
-                      <div>
-                        <div className="font-semibold text-[13px] text-slate-900 leading-snug group-hover:text-[#6C38FF] transition-colors">
-                          {card.title}
-                        </div>
-                        <div className="text-[11.5px] text-slate-500 mt-1 leading-snug">
-                          {card.subtitle}
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* Desktop Composer inside centered hero */}
-              <div className="hidden md:block w-full mt-6">
-                {renderComposer(false)}
-              </div>
-            </div>
-
-            {/* Mobile Composer pinned cleanly in thumb zone */}
-            <div className="block md:hidden w-full pt-4 pb-2">
-              {renderComposer(false)}
-            </div>
-          </div>
-
-          {/* Bottom Centered Language Selector Pill (Desktop) */}
-          <div className="hidden md:flex justify-center pb-5 pt-1 relative">
-            <div className="relative">
+        <>
+          <div className="flex-1 min-h-0 flex flex-col overflow-y-auto overscroll-contain px-4">
+            {/* Mobile centered Lock/Shaxsiy suhbat trigger matching mobile screenshot */}
+            <div className="flex md:hidden justify-center pt-1 pb-1 shrink-0">
               <button
                 type="button"
-                onClick={() => setShowLangMenu((prev) => !prev)}
-                className="flex items-center gap-2 px-4 py-1.5 rounded-full border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-600 transition-colors cursor-pointer"
+                onClick={onTogglePrivateChat}
+                className={`flex items-center gap-1.5 text-xs font-medium px-3 py-1 rounded-full transition-colors cursor-pointer ${
+                  isPrivateChat
+                    ? 'bg-violet-50 text-[#6C38FF]'
+                    : 'text-slate-500 hover:text-slate-800'
+                }`}
               >
-                <span>{selectedLang}</span>
-                <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                <Lock className="w-3.5 h-3.5" />
+                <span>{isPrivateChat ? 'Shaxsiy rejim faol' : 'Shaxsiy suhbat'}</span>
               </button>
+            </div>
 
-              {showLangMenu && (
-                <>
-                  <div
-                    className="fixed inset-0 z-30"
-                    onClick={() => setShowLangMenu(false)}
-                  />
-                  <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-40 bg-white rounded-xl shadow-lg border border-slate-200 py-1 z-40">
-                    {['O‘zbekcha', 'O‘zbekcha (Kirill)', 'English'].map((lang) => (
+            <div className="flex-1 flex flex-col items-center max-w-[760px] w-full mx-auto py-2 md:py-4">
+              {/* Hero Brand + Headline + 4 Cards */}
+              <div className="w-full flex flex-col items-center my-auto">
+                <AiBrandLogo size="lg" />
+
+                <h1 className="mt-4 sm:mt-5 text-[25px] sm:text-[32px] font-bold tracking-tight text-slate-900 text-center leading-[1.2] text-balance">
+                  Bugun nimada yordam beray?
+                </h1>
+                <p className="mt-2 text-[13.5px] sm:text-[15px] text-slate-500 text-center max-w-md leading-relaxed">
+                  G‘oyadan natijagacha — aqlli yordamchingiz yoningizda.
+                </p>
+
+                {/* 4 Suggestion Cards (2x2 Mobile, 4-col Desktop) */}
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-3 w-full mt-5 sm:mt-7">
+                  {suggestionCards.map((card) => {
+                    const Icon = card.icon;
+                    return (
                       <button
-                        key={lang}
+                        key={card.title}
                         type="button"
                         onClick={() => {
-                          setSelectedLang(lang);
-                          setShowLangMenu(false);
+                          setInput(card.prompt);
+                          textareaRef.current?.focus();
                         }}
-                        className={`w-full px-3 py-1.5 text-left text-xs hover:bg-slate-50 flex items-center justify-between cursor-pointer ${
-                          selectedLang === lang ? 'text-[#6C38FF] font-semibold' : 'text-slate-700'
-                        }`}
+                        className="bg-white border border-slate-200/90 hover:border-violet-300 hover:shadow-sm rounded-2xl p-3.5 sm:p-4 text-left transition-all flex flex-col items-start gap-2.5 sm:gap-3 cursor-pointer group"
                       >
-                        <span>{lang}</span>
-                        {selectedLang === lang && <Check className="w-3.5 h-3.5" />}
+                        <div
+                          className={`w-8 h-8 rounded-xl flex items-center justify-center ${card.iconBg}`}
+                        >
+                          <Icon className="w-4 h-4 stroke-[2]" />
+                        </div>
+                        <div>
+                          <div className="font-semibold text-[13px] text-slate-900 leading-snug group-hover:text-[#6C38FF] transition-colors">
+                            {card.title}
+                          </div>
+                          <div className="text-[11.5px] text-slate-500 mt-1 leading-snug">
+                            {card.subtitle}
+                          </div>
+                        </div>
                       </button>
-                    ))}
-                  </div>
-                </>
-              )}
+                    );
+                  })}
+                </div>
+
+                {/* Desktop Composer inside centered hero */}
+                <div className="hidden md:block w-full mt-6">
+                  {renderComposer(false)}
+                </div>
+              </div>
+            </div>
+
+            {/* Bottom Centered Language Selector Pill (Desktop) */}
+            <div className="hidden md:flex justify-center pb-5 pt-1 relative shrink-0">
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setShowLangMenu((prev) => !prev)}
+                  className="flex items-center gap-2 px-4 py-1.5 rounded-full border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-600 transition-colors cursor-pointer"
+                >
+                  <span>{selectedLang}</span>
+                  <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                </button>
+
+                {showLangMenu && (
+                  <>
+                    <div
+                      className="fixed inset-0 z-30"
+                      onClick={() => setShowLangMenu(false)}
+                    />
+                    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-40 bg-white rounded-xl shadow-lg border border-slate-200 py-1 z-40">
+                      {['O‘zbekcha', 'O‘zbekcha (Kirill)', 'English'].map((lang) => (
+                        <button
+                          key={lang}
+                          type="button"
+                          onClick={() => {
+                            setSelectedLang(lang);
+                            setShowLangMenu(false);
+                          }}
+                          className={`w-full px-3 py-1.5 text-left text-xs hover:bg-slate-50 flex items-center justify-between cursor-pointer ${
+                            selectedLang === lang ? 'text-[#6C38FF] font-semibold' : 'text-slate-700'
+                          }`}
+                        >
+                          <span>{lang}</span>
+                          {selectedLang === lang && <Check className="w-3.5 h-3.5" />}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
             </div>
           </div>
-        </div>
+
+          {/* Mobile Composer ALWAYS pinned cleanly at bottom (never scrolls out of view) */}
+          <div className="block md:hidden shrink-0 w-full bg-white px-4 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+            {renderComposer(false)}
+          </div>
+        </>
       ) : (
         /* ACTIVE CONVERSATION THREAD VIEW */
         <>
-          <div className="flex-1 overflow-y-auto px-4 py-6">
+          <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-4 py-6">
             <div className="max-w-[760px] mx-auto w-full space-y-6">
               {messages.map((msg) => {
                 const isUser = msg.role === 'user';
@@ -996,8 +998,10 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
             </div>
           </div>
 
-          <div className="w-full max-w-[760px] mx-auto px-4 pb-4 pt-1 bg-white">
-            {renderComposer(true)}
+          <div className="shrink-0 w-full bg-white px-4 pt-1 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:pb-4">
+            <div className="max-w-[760px] mx-auto w-full">
+              {renderComposer(true)}
+            </div>
           </div>
         </>
       )}

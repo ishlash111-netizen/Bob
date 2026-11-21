@@ -23,6 +23,7 @@ interface MemoryInspectorProps {
   currentSessionId: string;
   messages: ChatMessage[];
   onClearSession: () => void;
+  apiFetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 }
 
 interface MemoryFact {
@@ -37,6 +38,7 @@ export const MemoryInspector: React.FC<MemoryInspectorProps> = ({
   currentSessionId,
   messages,
   onClearSession,
+  apiFetch,
 }) => {
   const [testQuery, setTestQuery] = useState('u qachon tug‘ilgan?');
   const [testResult, setTestResult] = useState('');
@@ -44,10 +46,22 @@ export const MemoryInspector: React.FC<MemoryInspectorProps> = ({
   const [newFact, setNewFact] = useState('');
   const [isLoadingFacts, setIsLoadingFacts] = useState(false);
 
+  const doFetch = (url: string, init?: RequestInit) => {
+    if (apiFetch) return apiFetch(url, init);
+    return fetch(url, {
+      ...init,
+      credentials: 'include',
+      headers: {
+        ...(init?.headers || {}),
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+    });
+  };
+
   const fetchFacts = async () => {
     try {
       setIsLoadingFacts(true);
-      const res = await fetch('/api/memory/facts');
+      const res = await doFetch('/api/memory/facts');
       if (res.ok) {
         const data = await res.json();
         setFacts(data.facts || []);
@@ -61,13 +75,13 @@ export const MemoryInspector: React.FC<MemoryInspectorProps> = ({
 
   useEffect(() => {
     fetchFacts();
-  }, []);
+  }, [currentSessionId]);
 
   const handleAddFact = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newFact.trim()) return;
     try {
-      const res = await fetch('/api/memory/facts', {
+      const res = await doFetch('/api/memory/facts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fact: newFact.trim(), category: 'fact' }),
@@ -84,7 +98,7 @@ export const MemoryInspector: React.FC<MemoryInspectorProps> = ({
 
   const handleDeleteFact = async (id: string) => {
     try {
-      const res = await fetch(`/api/memory/facts/${id}`, { method: 'DELETE' });
+      const res = await doFetch(`/api/memory/facts/${id}`, { method: 'DELETE' });
       if (res.ok) {
         const data = await res.json();
         setFacts(data.facts || []);
@@ -149,7 +163,7 @@ export const MemoryInspector: React.FC<MemoryInspectorProps> = ({
             </span>
           </div>
           <span className="text-xs text-slate-400">
-            Fayl: <code className="text-emerald-400 font-mono">data/ai_memory.json</code>
+            Saqlash: <code className="text-emerald-400 font-mono">data/memory_*.json (har hisob uchun alohida)</code>
           </span>
         </div>
 

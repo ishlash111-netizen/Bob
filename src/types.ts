@@ -37,6 +37,7 @@ export interface ChatSession {
   updatedAt: string;
   userEmail?: string;
   messages: ChatMessage[];
+  messageCount?: number;
   lastEntity?: string | null;
 }
 

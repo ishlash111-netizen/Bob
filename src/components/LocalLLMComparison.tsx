@@ -12,8 +12,65 @@ import {
   AlertCircle,
   HelpCircle
 } from 'lucide-react';
-import { LOCAL_MODELS_DATA } from '../data/pythonCodebase';
 import { LocalModelInfo } from '../types';
+
+const LOCAL_MODELS_DATA: LocalModelInfo[] = [
+  {
+    name: 'Qwen 2.5 (7B)',
+    tag: 'qwen2.5:7b',
+    size: '4.7 GB',
+    ramNeeded: '8–16 GB RAM',
+    speed: 'Tezkor (25–45 tok/s)',
+    uzbekQuality: 'A’lo — o‘zbekcha grammatika va mantiqda kuchli',
+    useCase: 'Kundalik muloqot, dasturlash, tarjima va matn tahlili uchun eng muvozanatli tanlov.',
+    installCommand: 'ollama run qwen2.5:7b',
+    recommended: true,
+  },
+  {
+    name: 'Llama 3.1 (8B)',
+    tag: 'llama3.1:8b',
+    size: '4.9 GB',
+    ramNeeded: '8–16 GB RAM',
+    speed: 'Tezkor (22–40 tok/s)',
+    uzbekQuality: 'Yaxshi — ingliz va ko‘p tilli vazifalarda barqaror',
+    useCase: 'Umumiy bilim, hujjat tahlili va RAG tizimlari uchun ishonchli baza.',
+    installCommand: 'ollama run llama3.1:8b',
+    recommended: false,
+  },
+  {
+    name: 'DeepSeek-R1 (7B)',
+    tag: 'deepseek-r1:7b',
+    size: '4.7 GB',
+    ramNeeded: '8–16 GB RAM',
+    speed: 'O‘rtacha (18–35 tok/s)',
+    uzbekQuality: 'Yaxshi — bosqichma-bosqich fikrlashda kuchli',
+    useCase: 'Matematika, algoritmlar, murakkab mantiqiy masalalar va kod tahlili.',
+    installCommand: 'ollama run deepseek-r1:7b',
+    recommended: true,
+  },
+  {
+    name: 'Gemma 2 (2B)',
+    tag: 'gemma2:2b',
+    size: '1.6 GB',
+    ramNeeded: '4–8 GB RAM',
+    speed: 'Juda tez (50+ tok/s)',
+    uzbekQuality: 'Qoniqarli — qisqa javoblar va oddiy savollar uchun',
+    useCase: 'Zaif noutbuklar, oflayn tezkor yordamchi va minimal resursli qurilmalar.',
+    installCommand: 'ollama run gemma2:2b',
+    recommended: false,
+  },
+  {
+    name: 'Mistral Nemo (12B)',
+    tag: 'mistral-nemo:12b',
+    size: '7.1 GB',
+    ramNeeded: '16+ GB RAM',
+    speed: 'O‘rtacha (14–28 tok/s)',
+    uzbekQuality: 'Yaxshi — katta kontekst (128K) bilan ishlaydi',
+    useCase: 'Uzun hujjatlar, kitoblar va katta kod bazalarini tahlil qilish uchun.',
+    installCommand: 'ollama run mistral-nemo:12b',
+    recommended: false,
+  },
+];
 
 interface LocalLLMComparisonProps {
   onOpenWebGPU?: () => void;

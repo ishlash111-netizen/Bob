@@ -13,15 +13,30 @@ import { ChatMessage, ChatSession, UserProfile, FileAttachment } from './types';
 import { generateClientResponse } from './utils/clientAiEngine';
 import { getActiveWebLLMEngine, streamWebLLMCompletion } from './utils/webLlmEngine';
 
-export default function App() {
-  const [user, setUser] = useState<UserProfile | null>(() => {
-    try {
-      const saved = localStorage.getItem('uzunited_user');
-      return saved ? JSON.parse(saved) : null;
-    } catch {
-      return null;
+const createFreshSessionId = () =>
+  `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+const getOrCreateGuestId = (): string => {
+  try {
+    let existing = localStorage.getItem('uzunited_guest_id');
+    if (!existing || !/^[a-zA-Z0-9_-]{16,64}$/.test(existing)) {
+      const rand =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID().replace(/-/g, '')
+          : `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+      existing = `g_${rand}`;
+      localStorage.setItem('uzunited_guest_id', existing);
     }
-  });
+    return existing;
+  } catch {
+    return `g_${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+  }
+};
+
+export default function App() {
+  const [user, setUser] = useState<UserProfile | null>(null);
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [guestId] = useState<string>(() => getOrCreateGuestId());
 
   const [currentTab, setCurrentTab] = useState<AppTabType>('chat');
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
@@ -41,51 +56,50 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState('UZUNITED AI v1.0');
   const [tokenCount, setTokenCount] = useState(842);
 
-  const [sessionId, setSessionId] = useState<string>('default-uzunited-session');
+  const [sessionId, setSessionId] = useState<string>(() => createFreshSessionId());
   const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [messages, setMessages] = useState<ChatMessage[]>(() => {
-    const savedUser = (() => {
-      try {
-        const s = localStorage.getItem('uzunited_user');
-        return s ? JSON.parse(s) : null;
-      } catch {
-        return null;
-      }
-    })();
-
-    const greeting = savedUser?.firstName 
-      ? `Salom, **${savedUser.firstName}**! Men **UZUNITED AI** man. Bugun qanday mavzuda suhbatlashamiz yoki qanday yordam bera olaman?`
-      : "Salom! Men **UZUNITED AI** man — universal sun'iy intellekt yordamchingiz. Qanday mavzuda suhbatlashamiz yoki qanday savolingiz bor?";
-
-    return [
-      {
-        id: 'msg-0',
-        role: 'assistant',
-        content: greeting,
-        timestamp: new Date().toISOString(),
-      }
-    ];
-  });
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: 'msg-0',
+      role: 'assistant',
+      content: "Salom! Men **UZUNITED AI** man — universal sun'iy intellekt yordamchingiz. Qanday mavzuda suhbatlashamiz yoki qanday savolingiz bor?",
+      timestamp: new Date().toISOString(),
+    }
+  ]);
   const [isLoading, setIsLoading] = useState(false);
   const [activeReasoningSteps, setActiveReasoningSteps] = useState<string[]>([]);
 
-  // Fetch list of all sessions partitioned by user email
-  const fetchSessions = async (targetEmail?: string, autoRestore = false) => {
+  // Authenticated fetch wrapper (always attaches in-memory Bearer token, HttpOnly cookie credentials, and per-device guest ID)
+  const apiFetch = (input: RequestInfo | URL, init: RequestInit = {}, overrideToken?: string | null) => {
+    const tokenToUse = overrideToken !== undefined ? overrideToken : authToken;
+    const headers = new Headers(init.headers || {});
+    headers.set('X-Requested-With', 'XMLHttpRequest');
+    headers.set('X-Guest-Id', guestId);
+    if (tokenToUse) {
+      headers.set('Authorization', `Bearer ${tokenToUse}`);
+    }
+    return fetch(input, {
+      ...init,
+      credentials: 'include',
+      headers,
+    });
+  };
+
+  // Fetch list of sessions strictly for the current verified user (or isolated guest browser)
+  const fetchSessions = async (autoRestore = false, overrideToken?: string | null, ownerEmail?: string | null) => {
     try {
-      const emailToUse = targetEmail !== undefined ? targetEmail : (user?.email || '');
-      const url = emailToUse ? `/api/memory/sessions?email=${encodeURIComponent(emailToUse)}` : '/api/memory/sessions';
-      const res = await fetch(url);
+      const res = await apiFetch('/api/memory/sessions', {}, overrideToken);
       if (res.ok) {
         const data = await res.json();
-        if (data.sessions && data.sessions.length > 0) {
-          setSessions(data.sessions);
-          if (autoRestore) {
-            const storageKey = emailToUse ? `uzunited_current_session_${emailToUse}` : 'uzunited_current_session';
-            const savedCurrentId = localStorage.getItem(storageKey);
-            const target = data.sessions.find((s: any) => s.id === savedCurrentId) || data.sessions[0];
-            if (target && target.messageCount > 0) {
-              handleSelectSession(target.id, emailToUse);
-            }
+        const list = Array.isArray(data.sessions) ? data.sessions : [];
+        setSessions(list);
+        if (autoRestore && list.length > 0) {
+          const scopeKey = ownerEmail || guestId;
+          const storageKey = `uzunited_current_session_${scopeKey}`;
+          const savedCurrentId = localStorage.getItem(storageKey);
+          const target = list.find((s: any) => s.id === savedCurrentId) || list[0];
+          if (target && target.messageCount > 0) {
+            handleSelectSession(target.id, overrideToken, scopeKey);
           }
         }
       }
@@ -94,50 +108,35 @@ export default function App() {
     }
   };
 
-  // Fetch user profile from server for true cross-session persistence
-  const fetchUserProfile = async () => {
-    try {
-      const savedUserStr = localStorage.getItem('uzunited_user');
-      if (!savedUserStr) {
-        return;
-      }
-      const localUser = JSON.parse(savedUserStr);
-      if (!localUser?.email) {
-        return;
-      }
-      const res = await fetch(`/api/user/profile?email=${encodeURIComponent(localUser.email)}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.user) {
-          setUser(prev => {
-            const merged = { ...prev, ...data.user };
-            localStorage.setItem('uzunited_user', JSON.stringify(merged));
-            return merged;
-          });
-        }
-      }
-    } catch (e) {
-      console.warn('Failed to load user profile from server', e);
-    }
-  };
-
-  // Initial load
+  // Initial load: clean legacy unverified localStorage auth keys and restore session purely from verified server cookie
   useEffect(() => {
     try {
       localStorage.removeItem('uzunited_admin_mode');
       localStorage.removeItem('uzunited_admin_directives');
+      localStorage.removeItem('uzunited_user');
+      Object.keys(localStorage).forEach((k) => {
+        if (k.startsWith('uzunited_pwd_')) localStorage.removeItem(k);
+      });
     } catch {}
-    fetchUserProfile();
-  }, []);
 
-  // Sync sessions whenever user email is loaded or changed
-  useEffect(() => {
-    if (user?.email) {
-      fetchSessions(user.email, true);
-    } else {
-      fetchSessions('', true);
-    }
-  }, [user?.email]);
+    const bootstrapAuth = async () => {
+      try {
+        const res = await apiFetch('/api/auth/me');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.user) {
+            setUser(data.user);
+            fetchSessions(true, null, data.user.email);
+            return;
+          }
+        }
+      } catch (e) {
+        console.warn('Auth bootstrap check failed', e);
+      }
+      fetchSessions(false);
+    };
+    bootstrapAuth();
+  }, []);
 
   // Global Cmd+K / Ctrl+K shortcut for new chat
   useEffect(() => {
@@ -232,18 +231,18 @@ export default function App() {
         ]);
         setTokenCount(prev => prev + Math.floor(generatedText.length / 3));
 
-        // Save session history permanently partitioned by user email
-        const updatedMsgs = [...messages, userMsg, { ...placeholderAssistantMsg, content: generatedText }];
-        fetch(`/api/memory/sessions/${sessionId}/sync`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            messages: updatedMsgs,
-            email: user?.email,
-            userEmail: user?.email,
-            title: effectiveContent.slice(0, 30) + (effectiveContent.length > 30 ? '...' : ''),
-          }),
-        }).then(() => fetchSessions(user?.email)).catch(() => {});
+        // Save session history permanently partitioned by verified owner
+        if (!isPrivateChat) {
+          const updatedMsgs = [...messages, userMsg, { ...placeholderAssistantMsg, content: generatedText }];
+          apiFetch(`/api/memory/sessions/${sessionId}/sync`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              messages: updatedMsgs,
+              title: effectiveContent.slice(0, 30) + (effectiveContent.length > 30 ? '...' : ''),
+            }),
+          }).then(() => fetchSessions(false, undefined, user?.email)).catch(() => {});
+        }
 
         setIsLoading(false);
         return;
@@ -259,18 +258,15 @@ export default function App() {
           const controller = new AbortController();
           const timeoutId = setTimeout(() => controller.abort(), 35000);
 
-          const res = await fetch('/api/chat', {
+          const res = await apiFetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               sessionId,
-              email: user?.email,
-              userEmail: user?.email,
               message: effectiveContent,
               isDeepSearch,
               isAiMode,
               customModel: selectedModel,
-              userProfile: user,
               attachments,
             }),
             signal: controller.signal,
@@ -303,20 +299,18 @@ export default function App() {
         setTokenCount(prev => prev + Math.floor((data.assistantMessage.content?.length || 100) / 3));
       }
 
-      // If AI extracted new learned preferences, save them into the user's profile!
+      // If AI extracted new learned preferences, update local user state
       if (data.newLearnedPreferences && data.newLearnedPreferences.length > 0 && user) {
         setUser(prev => {
           if (!prev) return null;
           const existing = prev.learnedPreferences || [];
           const combined = Array.from(new Set([...existing, ...data.newLearnedPreferences]));
-          const updated = { ...prev, learnedPreferences: combined };
-          localStorage.setItem('uzunited_user', JSON.stringify(updated));
-          return updated;
+          return { ...prev, learnedPreferences: combined };
         });
       }
 
-      // Refresh sessions list for this user email
-      fetchSessions(user?.email);
+      // Refresh sessions list strictly for this user/device
+      fetchSessions(false, undefined, user?.email);
     } catch (err: any) {
       console.warn('Chat request handled with client AI engine:', err);
       
@@ -338,17 +332,16 @@ export default function App() {
       
       setMessages(prev => {
         const nextMsgs = [...prev, assistantMsg];
-        // Ensure chat history is immediately synchronized and persisted to backend disk
-        fetch(`/api/memory/sessions/${sessionId}/sync`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            messages: nextMsgs,
-            email: user?.email,
-            userEmail: user?.email,
-            title: effectiveContent.slice(0, 30) + (effectiveContent.length > 30 ? '...' : ''),
-          }),
-        }).then(() => fetchSessions(user?.email)).catch(() => {});
+        if (!isPrivateChat) {
+          apiFetch(`/api/memory/sessions/${sessionId}/sync`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              messages: nextMsgs,
+              title: effectiveContent.slice(0, 30) + (effectiveContent.length > 30 ? '...' : ''),
+            }),
+          }).then(() => fetchSessions(false, undefined, user?.email)).catch(() => {});
+        }
         return nextMsgs;
       });
     } finally {
@@ -359,45 +352,44 @@ export default function App() {
   // Create new chat
   const handleNewChat = async () => {
     try {
-      const res = await fetch('/api/memory/new-session', { 
+      const res = await apiFetch('/api/memory/new-session', { 
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: user?.email, userEmail: user?.email }),
+        body: JSON.stringify({}),
       });
       const data = await res.json();
       if (data.session) {
         setSessionId(data.session.id);
-        const storageKey = user?.email ? `uzunited_current_session_${user.email}` : 'uzunited_current_session';
-        localStorage.setItem(storageKey, data.session.id);
+        const scopeKey = user?.email || guestId;
+        localStorage.setItem(`uzunited_current_session_${scopeKey}`, data.session.id);
         setMessages(data.session.messages);
         setActiveReasoningSteps([]);
-        fetchSessions(user?.email);
+        fetchSessions(false, undefined, user?.email);
+        return;
       }
-    } catch (e) {
-      const newId = `session-${Date.now()}`;
-      setSessionId(newId);
-      const storageKey = user?.email ? `uzunited_current_session_${user.email}` : 'uzunited_current_session';
-      localStorage.setItem(storageKey, newId);
-      setMessages([
-        {
-          id: `msg-${Date.now()}`,
-          role: 'assistant',
-          content: "Assalomu alaykum! Yangi suhbat boshlandi. Men **UZUNITED AI** man. Sizga qanday yordam bera olaman?",
-          timestamp: new Date().toISOString(),
-        }
-      ]);
-      setActiveReasoningSteps([]);
-    }
+    } catch {}
+
+    const newId = createFreshSessionId();
+    setSessionId(newId);
+    const scopeKey = user?.email || guestId;
+    localStorage.setItem(`uzunited_current_session_${scopeKey}`, newId);
+    setMessages([
+      {
+        id: `msg-${Date.now()}`,
+        role: 'assistant',
+        content: "Assalomu alaykum! Yangi suhbat boshlandi. Men **UZUNITED AI** man. Sizga qanday yordam bera olaman?",
+        timestamp: new Date().toISOString(),
+      }
+    ]);
+    setActiveReasoningSteps([]);
   };
 
   // Select an existing session
-  const handleSelectSession = async (targetId: string, emailToUse?: string) => {
-    const curEmail = emailToUse !== undefined ? emailToUse : (user?.email || '');
-    const storageKey = curEmail ? `uzunited_current_session_${curEmail}` : 'uzunited_current_session';
-    localStorage.setItem(storageKey, targetId);
+  const handleSelectSession = async (targetId: string, overrideToken?: string | null, scopeOverride?: string) => {
+    const scopeKey = scopeOverride || user?.email || guestId;
+    localStorage.setItem(`uzunited_current_session_${scopeKey}`, targetId);
     try {
-      const url = curEmail ? `/api/memory/sessions/${targetId}?email=${encodeURIComponent(curEmail)}` : `/api/memory/sessions/${targetId}`;
-      const res = await fetch(url);
+      const res = await apiFetch(`/api/memory/sessions/${encodeURIComponent(targetId)}`, {}, overrideToken);
       if (res.ok) {
         const data = await res.json();
         if (data.session) {
@@ -410,19 +402,30 @@ export default function App() {
     } catch (e) {
       console.warn('Could not fetch session detail', e);
     }
-    // Fallback switch ID
     setSessionId(targetId);
   };
 
-  // Delete an individual chat session (bittalab o'chirish)
+  // Delete an individual chat session
   const handleDeleteSession = async (targetId: string) => {
     try {
-      await fetch(`/api/memory/sessions/${targetId}`, { method: 'DELETE' });
-      // Update local sessions list
+      await apiFetch(`/api/memory/sessions/${encodeURIComponent(targetId)}`, { method: 'DELETE' });
       setSessions(prev => prev.filter(s => s.id !== targetId));
-      // If current session was deleted, start new one
       if (sessionId === targetId) {
-        handleNewChat();
+        const freshId = createFreshSessionId();
+        setSessionId(freshId);
+        const scopeKey = user?.email || guestId;
+        try {
+          localStorage.removeItem(`uzunited_current_session_${scopeKey}`);
+        } catch {}
+        setMessages([
+          {
+            id: 'msg-0',
+            role: 'assistant',
+            content: "Salom! Men **UZUNITED AI** man — universal sun'iy intellekt yordamchingiz. Qanday mavzuda suhbatlashamiz yoki qanday savolingiz bor?",
+            timestamp: new Date().toISOString(),
+          }
+        ]);
+        setActiveReasoningSteps([]);
       }
     } catch (e) {
       console.warn('Failed to delete session', e);
@@ -431,27 +434,29 @@ export default function App() {
   };
 
   // Auth callbacks
-  const handleAuthSuccess = (authenticatedUser: UserProfile) => {
+  const handleAuthSuccess = (authenticatedUser: UserProfile, token?: string) => {
+    setAuthToken(token || null);
     setUser(authenticatedUser);
-    localStorage.setItem('uzunited_user', JSON.stringify(authenticatedUser));
     setIsAuthModalOpen(false);
-    fetchSessions(authenticatedUser.email, true);
+    setSessions([]);
+    const freshId = createFreshSessionId();
+    setSessionId(freshId);
     setMessages([
       {
         id: `msg-${Date.now()}`,
         role: 'assistant',
-        content: `Assalomu alaykum, **${authenticatedUser.firstName}**! 🎉\n\nMen **UZUNITED AI** man. Suhbatlaringiz va eslab qolingan mavzular profilingiz (${authenticatedUser.email}) bilan muvaffaqiyatli bog'landi. Qanday savolingiz bor yoki nima haqida suhbatlashamiz? 😊`,
+        content: `Assalomu alaykum, **${authenticatedUser.firstName}**! 🎉\n\nMen **UZUNITED AI** man. Suhbatlaringiz va eslab qolingan mavzular faqat sizning profilingiz (${authenticatedUser.email}) bilan xavfsiz bog'landi. Qanday savolingiz bor yoki nima haqida suhbatlashamiz? 😊`,
         timestamp: new Date().toISOString(),
       }
     ]);
+    fetchSessions(true, token || null, authenticatedUser.email);
   };
 
   // User profile update
   const handleUpdateUser = async (updated: UserProfile) => {
     setUser(updated);
-    localStorage.setItem('uzunited_user', JSON.stringify(updated));
     try {
-      await fetch('/api/user/profile', {
+      await apiFetch('/api/user/profile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ profile: updated }),
@@ -462,11 +467,17 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    localStorage.removeItem('uzunited_user');
+    try {
+      await apiFetch('/api/auth/logout', { method: 'POST' });
+    } catch {}
+    try {
+      localStorage.removeItem('uzunited_user');
+    } catch {}
+    setAuthToken(null);
     setUser(null);
     setSessions([]);
-    const guestId = `session-${Date.now()}`;
-    setSessionId(guestId);
+    const freshId = createFreshSessionId();
+    setSessionId(freshId);
     setMessages([
       {
         id: 'msg-0',
@@ -475,9 +486,7 @@ export default function App() {
         timestamp: new Date().toISOString(),
       }
     ]);
-    try {
-      await fetch('/api/auth/logout', { method: 'POST' });
-    } catch {}
+    fetchSessions(false, null);
     setIsAuthModalOpen(true);
   };
 
@@ -512,7 +521,7 @@ export default function App() {
   };
 
   return (
-    <div className="h-screen flex bg-white text-slate-900 overflow-hidden font-sans select-text">
+    <div className="fixed inset-0 h-[100dvh] w-full flex bg-white text-slate-900 overflow-hidden font-sans select-text">
       {/* Persistent Desktop Sidebar + Mobile Slide-Over Drawer */}
       <SidebarDrawer
         isOpen={isSidebarOpen}
@@ -532,7 +541,7 @@ export default function App() {
       />
 
       {/* Right Main Area */}
-      <div className="flex-1 flex flex-col min-w-0 h-full bg-white">
+      <div className="flex-1 flex flex-col min-w-0 min-h-0 h-full bg-white overflow-hidden">
         <Header
           onOpenMenu={() => setIsSidebarOpen(true)}
           desktopSidebarOpen={desktopSidebarOpen}
@@ -552,7 +561,7 @@ export default function App() {
         />
 
         {/* Main Multi-Module Viewport */}
-        <main className="flex-1 flex flex-col overflow-hidden bg-white">
+        <main className="flex-1 min-h-0 flex flex-col overflow-hidden bg-white">
           {currentTab === 'chat' && (
             <ChatInterface
               messages={messages}
@@ -594,6 +603,7 @@ export default function App() {
                 currentSessionId={sessionId}
                 messages={messages}
                 onClearSession={handleNewChat}
+                apiFetch={apiFetch}
               />
             </div>
           )}

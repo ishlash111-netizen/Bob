@@ -12,8 +12,198 @@ import {
   ExternalLink,
   Code
 } from 'lucide-react';
-import { PYTHON_CODEBASE_FILES } from '../data/pythonCodebase';
 import { PythonFileItem } from '../types';
+
+const PYTHON_CODEBASE_FILES: PythonFileItem[] = [
+  {
+    filename: 'main.py',
+    path: 'backend/main.py',
+    category: 'Backend',
+    description: 'FastAPI asosiy serveri, REST API endpointlar va CORS sozlamalari.',
+    content: `from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from agent import UzbekAIAgent
+
+app = FastAPI(title="UZUNITED AI Backend", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+agent = UzbekAIAgent()
+
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+    use_web_search: bool = False
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok", "engine": "FastAPI + Ollama"}
+
+@app.post("/api/chat")
+async def chat_endpoint(req: ChatRequest):
+    try:
+        result = await agent.run(
+            session_id=req.session_id,
+            query=req.message,
+            search_web=req.use_web_search,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+`,
+  },
+  {
+    filename: 'agent.py',
+    path: 'backend/agent.py',
+    category: 'Agent Core',
+    description: 'Muloqot kontekstini boshqaruvchi va Ollama modeliga murojaat qiluvchi yadro.',
+    content: `import httpx
+from database import load_history, save_message
+from web_search import search_duckduckgo
+
+OLLAMA_URL = "http://localhost:11434/api/chat"
+MODEL_NAME = "qwen2.5:7b"
+
+class UzbekAIAgent:
+    SYSTEM_PROMPT = (
+        "Siz UZUNITED AI — o'zbek tilidagi aqlli, aniq va do'stona yordamchisiz. "
+        "Javoblarni tushunarli, mantiqiy va foydali tarzda bering."
+    )
+
+    async def run(self, session_id: str, query: str, search_web: bool = False):
+        history = load_history(session_id)
+        sources = []
+
+        context_note = ""
+        if search_web:
+            sources = await search_duckduckgo(query)
+            if sources:
+                context_note = "\\n\\nInternet manbalari:\\n" + "\\n".join(
+                    f"- {s['title']}: {s['snippet']} ({s['url']})" for s in sources
+                )
+
+        messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
+        messages.extend(history[-10:])
+        messages.append({"role": "user", "content": query + context_note})
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                OLLAMA_URL,
+                json={"model": MODEL_NAME, "messages": messages, "stream": False},
+            )
+            resp.raise_for_status()
+            answer = resp.json()["message"]["content"]
+
+        save_message(session_id, "user", query)
+        save_message(session_id, "assistant", answer)
+        return {"answer": answer, "sources": sources}
+`,
+  },
+  {
+    filename: 'web_search.py',
+    path: 'backend/web_search.py',
+    category: 'Web Search',
+    description: 'DuckDuckGo orqali tezkor va bepul real-vaqt veb-qidiruv moduli.',
+    content: `from duckduckgo_search import DDGS
+
+async def search_duckduckgo(query: str, max_results: int = 4):
+    results = []
+    with DDGS() as ddgs:
+        for idx, item in enumerate(ddgs.text(query, max_results=max_results), start=1):
+            results.append({
+                "id": idx,
+                "title": item.get("title", ""),
+                "url": item.get("href", ""),
+                "snippet": item.get("body", ""),
+            })
+    return results
+`,
+  },
+  {
+    filename: 'database.py',
+    path: 'backend/database.py',
+    category: 'Database',
+    description: 'SQLite yordamida foydalanuvchi suhbatlari va uzoq muddatli xotirani saqlash.',
+    content: `import sqlite3
+from pathlib import Path
+
+DB_PATH = Path("uzunited_memory.db")
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+def save_message(session_id: str, role: str, content: str):
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content),
+        )
+
+def load_history(session_id: str):
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC",
+            (session_id,),
+        ).fetchall()
+    return [{"role": r, "content": c} for r, c in rows]
+`,
+  },
+  {
+    filename: 'requirements.txt',
+    path: 'backend/requirements.txt',
+    category: 'Config',
+    description: 'Python muhiti uchun kerakli kutubxonalar ro‘yxati.',
+    content: `fastapi==0.115.0
+uvicorn[standard]==0.30.6
+httpx==0.27.2
+pydantic==2.9.2
+duckduckgo-search==6.2.13
+`,
+  },
+  {
+    filename: 'docker-compose.yml',
+    path: 'docker-compose.yml',
+    category: 'Config',
+    description: 'Backend va lokal Ollama xizmatini Docker orqali birga ishga tushirish.',
+    content: `services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - ollama
+
+volumes:
+  ollama_data:
+`,
+  },
+];
 
 export const CodebaseExplorer: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<PythonFileItem>(PYTHON_CODEBASE_FILES[0]);

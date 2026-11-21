@@ -1,13 +1,21 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
 
 const app = express();
+app.set("trust proxy", 1);
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex");
+const GOOGLE_CLIENT_ID =
+  process.env.GOOGLE_CLIENT_ID ||
+  "973689737727-8b5slrifj74htotd92e2ai0ab02nhuld.apps.googleusercontent.com";
+const AUTH_COOKIE_NAME = "uzunited_session";
 
 // Handle Vercel pre-parsed body safely to prevent serverless stream hang
 app.use((req, res, next) => {
@@ -20,14 +28,57 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-// Enable CORS for iframe and preview cross-origin requests
+function getRequestHost(req: express.Request): string {
+  const fwdHost = req.headers["x-forwarded-host"];
+  const raw = Array.isArray(fwdHost) ? fwdHost[0] : fwdHost || req.headers.host || "";
+  return raw.split(",")[0].trim().toLowerCase();
+}
+
+function isOriginAllowed(origin: string | undefined, req: express.Request): boolean {
+  if (!origin) return false;
+  try {
+    const parsed = new URL(origin);
+    const reqHost = getRequestHost(req);
+    return Boolean(reqHost) && parsed.host.toLowerCase() === reqHost;
+  } catch {
+    return false;
+  }
+}
+
+// Same-origin / verified-host CORS & CSRF protection (never wildcard * with credentials)
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin, req)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Guest-Id, X-Requested-With"
+  );
+
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
   }
+
+  // CSRF defense on mutating /api/* routes when cookies are used
+  if (
+    req.url.startsWith("/api") &&
+    ["POST", "PUT", "PATCH", "DELETE"].includes(req.method.toUpperCase())
+  ) {
+    const hasAuthBearer = Boolean(req.headers.authorization?.startsWith("Bearer "));
+    const hasCustomHeader = req.headers["x-requested-with"] === "XMLHttpRequest";
+    const originValid = origin ? isOriginAllowed(origin, req) : true;
+    if (!originValid) {
+      return res.status(403).json({ error: "Noto‘g‘ri manba (Origin) so‘rovi rad etildi." });
+    }
+    if (req.headers.cookie && !hasAuthBearer && !hasCustomHeader && !origin) {
+      return res.status(403).json({ error: "Xavfsizlik tekshiruvi muvaffaqiyatsiz tugadi." });
+    }
+  }
+
   next();
 });
 
@@ -75,13 +126,186 @@ export interface UserProfileData {
 }
 
 // Persistent user storage on disk
-const DATA_DIR = path.join(process.cwd(), "data");
-const USERS_FILE = path.join(DATA_DIR, "users_db.json");
+const DATA_DIR = path.resolve(process.cwd(), "data");
+const USERS_FILE = path.resolve(DATA_DIR, "users_db.json");
+
+function resolveSafeDataPath(fileName: string): string | null {
+  const safeBase = path.resolve(DATA_DIR);
+  const resolved = path.resolve(safeBase, fileName);
+  if (!resolved.startsWith(safeBase + path.sep)) {
+    return null;
+  }
+  return resolved;
+}
 
 if (!fs.existsSync(DATA_DIR)) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   } catch {}
+}
+
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const derived = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `scrypt$${salt}$${derived}`;
+}
+
+function verifyPassword(password: string, storedHash?: string): { valid: boolean; needsRehash: boolean } {
+  if (!storedHash || storedHash.startsWith("GOOGLE_AUTH_")) {
+    return { valid: false, needsRehash: false };
+  }
+  if (storedHash.startsWith("scrypt$")) {
+    const parts = storedHash.split("$");
+    if (parts.length !== 3) return { valid: false, needsRehash: false };
+    const [, salt, hexHash] = parts;
+    const derived = crypto.scryptSync(password, salt, 64);
+    const storedBuf = Buffer.from(hexHash, "hex");
+    if (derived.length !== storedBuf.length) return { valid: false, needsRehash: false };
+    return { valid: crypto.timingSafeEqual(derived, storedBuf), needsRehash: false };
+  }
+  // Legacy plaintext compatibility with automatic upgrade on valid login
+  const a = Buffer.from(password, "utf-8");
+  const b = Buffer.from(storedHash, "utf-8");
+  if (a.length !== b.length) return { valid: false, needsRehash: false };
+  return { valid: crypto.timingSafeEqual(a, b), needsRehash: true };
+}
+
+function createSessionToken(email: string): string {
+  const cleanEmail = email.trim().toLowerCase();
+  const payload = Buffer.from(
+    JSON.stringify({
+      email: cleanEmail,
+      iat: Date.now(),
+      exp: Date.now() + 30 * 24 * 60 * 60 * 1000,
+    }),
+    "utf-8"
+  ).toString("base64url");
+  const sig = crypto
+    .createHmac("sha256", SESSION_SECRET)
+    .update(payload)
+    .digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+function verifySessionToken(token?: string | null): { email: string } | null {
+  if (!token || typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const [payloadB64, sigB64] = parts;
+  const expectedSig = crypto
+    .createHmac("sha256", SESSION_SECRET)
+    .update(payloadB64)
+    .digest("base64url");
+
+  const sigBuf = Buffer.from(sigB64, "utf-8");
+  const expBuf = Buffer.from(expectedSig, "utf-8");
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return null;
+  }
+
+  try {
+    const decoded = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf-8"));
+    if (!decoded?.email || typeof decoded.exp !== "number" || decoded.exp < Date.now()) {
+      return null;
+    }
+    return { email: String(decoded.email).trim().toLowerCase() };
+  } catch {
+    return null;
+  }
+}
+
+function parseCookies(req: express.Request): Record<string, string> {
+  const header = req.headers.cookie;
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx > -1) {
+      const k = part.slice(0, idx).trim();
+      const v = part.slice(idx + 1).trim();
+      try {
+        out[k] = decodeURIComponent(v);
+      } catch {
+        out[k] = v;
+      }
+    }
+  }
+  return out;
+}
+
+function setAuthCookie(res: express.Response, req: express.Request, token: string) {
+  const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
+  const attrs = [
+    `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    "Path=/",
+    "Max-Age=2592000",
+    "HttpOnly",
+    isHttps ? "Secure" : "",
+    isHttps ? "SameSite=None" : "SameSite=Lax",
+    isHttps ? "Partitioned" : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
+  res.setHeader("Set-Cookie", attrs);
+}
+
+function clearAuthCookie(res: express.Response, req: express.Request) {
+  const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
+  const attrs = [
+    `${AUTH_COOKIE_NAME}=`,
+    "Path=/",
+    "Max-Age=0",
+    "HttpOnly",
+    isHttps ? "Secure" : "",
+    isHttps ? "SameSite=None" : "SameSite=Lax",
+    isHttps ? "Partitioned" : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
+  res.setHeader("Set-Cookie", attrs);
+}
+
+interface RequestOwner {
+  ownerId: string | null;
+  email: string | null;
+  isAuthenticated: boolean;
+}
+
+function resolveRequestOwner(req: express.Request): RequestOwner {
+  const authHeader = req.headers.authorization;
+  let token: string | undefined;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    token = authHeader.slice(7).trim();
+  }
+  if (!token) {
+    const cookies = parseCookies(req);
+    token = cookies[AUTH_COOKIE_NAME];
+  }
+
+  const verified = verifySessionToken(token);
+  if (verified?.email) {
+    return {
+      ownerId: `user:${verified.email}`,
+      email: verified.email,
+      isAuthenticated: true,
+    };
+  }
+
+  const rawGuestId = req.headers["x-guest-id"];
+  const guestId = typeof rawGuestId === "string" ? rawGuestId.trim() : "";
+  if (/^[a-zA-Z0-9_-]{16,64}$/.test(guestId)) {
+    return {
+      ownerId: `guest:${guestId}`,
+      email: null,
+      isAuthenticated: false,
+    };
+  }
+
+  return {
+    ownerId: null,
+    email: null,
+    isAuthenticated: false,
+  };
 }
 
 function loadSavedUsers(): Record<string, { profile: UserProfileData; passwordHash?: string }> {
@@ -105,32 +329,86 @@ function saveUsers(users: Record<string, { profile: UserProfileData; passwordHas
   }
 }
 
-function getUserByEmail(email?: string): UserProfileData | null {
+function getUserByEmail(email?: string | null): UserProfileData | null {
   if (!email) return null;
   const clean = email.trim().toLowerCase();
   const users = loadSavedUsers();
   return users[clean]?.profile || null;
 }
 
-// Safely decode Google Identity Services JWT payload
-function decodeGoogleCredential(jwtToken: string): any {
-  try {
-    const parts = jwtToken.split(".");
-    if (parts.length < 2) return null;
-    let base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    while (base64.length % 4) {
-      base64 += "=";
+// Verify Google ID token or OAuth2 access token with Google's servers
+async function verifyGoogleAuth(params: {
+  credential?: string;
+  accessToken?: string;
+}): Promise<{
+  email: string;
+  firstName: string;
+  lastName: string;
+  avatar: string;
+  sub: string;
+} | null> {
+  const { credential, accessToken } = params;
+
+  if (credential && typeof credential === "string") {
+    try {
+      const resp = await fetch(
+        `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(credential)}`,
+        { signal: AbortSignal.timeout(5000) }
+      );
+      if (resp.ok) {
+        const info = await resp.json();
+        const emailVerified = info.email_verified === true || info.email_verified === "true";
+        if (info.email && emailVerified && info.aud === GOOGLE_CLIENT_ID) {
+          return {
+            email: String(info.email).trim().toLowerCase(),
+            firstName: String(info.given_name || info.name?.split(" ")[0] || ""),
+            lastName: String(info.family_name || info.name?.split(" ").slice(1).join(" ") || ""),
+            avatar: String(info.picture || ""),
+            sub: String(info.sub || ""),
+          };
+        }
+      }
+    } catch (err) {
+      console.warn("Google id_token verification error:", err);
     }
-    const payload = Buffer.from(base64, "base64").toString("utf-8");
-    return JSON.parse(payload);
-  } catch (err) {
-    console.warn("Failed to decode Google JWT token:", err);
-    return null;
   }
+
+  if (accessToken && typeof accessToken === "string") {
+    try {
+      const tokenInfoRes = await fetch(
+        `https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(accessToken)}`,
+        { signal: AbortSignal.timeout(5000) }
+      );
+      if (!tokenInfoRes.ok) return null;
+      const tokenInfo = await tokenInfoRes.json();
+      if (tokenInfo.aud !== GOOGLE_CLIENT_ID && tokenInfo.azp !== GOOGLE_CLIENT_ID) {
+        return null;
+      }
+
+      const userInfoRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!userInfoRes.ok) return null;
+      const profile = await userInfoRes.json();
+      if (!profile.email || profile.email_verified === false) return null;
+
+      return {
+        email: String(profile.email).trim().toLowerCase(),
+        firstName: String(profile.given_name || profile.name?.split(" ")[0] || ""),
+        lastName: String(profile.family_name || profile.name?.split(" ").slice(1).join(" ") || ""),
+        avatar: String(profile.picture || ""),
+        sub: String(profile.sub || ""),
+      };
+    } catch (err) {
+      console.warn("Google access_token verification error:", err);
+    }
+  }
+
+  return null;
 }
 
-const SESSIONS_FILE = path.join(DATA_DIR, "chat_sessions.json");
-const AI_MEMORY_FILE = path.join(DATA_DIR, "ai_memory.json");
+const SESSIONS_FILE = path.resolve(DATA_DIR, "chat_sessions.json");
 
 interface ChatMessage {
   id: string;
@@ -155,6 +433,7 @@ interface ChatSession {
   title: string;
   createdAt: string;
   updatedAt: string;
+  ownerId?: string;
   userEmail?: string;
   messages: ChatMessage[];
   entityMemory: Record<string, string>; // e.g. "u": "Sam Altman", "birinchisi": "Python"
@@ -173,12 +452,16 @@ interface AiMemoryData {
   lastUpdated?: string;
 }
 
-const defaultSessionId = "default-uzunited-session";
-
-function getUserSessionsFilePath(email?: string): string | null {
+function getUserSessionsFilePath(email?: string | null): string | null {
   if (!email) return null;
   const clean = email.toLowerCase().trim().replace(/[^a-z0-9_.-]/g, "_");
-  return path.join(DATA_DIR, `sessions_${clean}.json`);
+  return resolveSafeDataPath(`sessions_${clean}.json`);
+}
+
+function getOwnerMemoryFilePath(ownerId?: string | null): string | null {
+  if (!ownerId) return null;
+  const digest = crypto.createHash("sha256").update(ownerId).digest("hex").slice(0, 24);
+  return resolveSafeDataPath(`memory_${digest}.json`);
 }
 
 function loadSavedSessions(): Map<string, ChatSession> {
@@ -187,77 +470,66 @@ function loadSavedSessions(): Map<string, ChatSession> {
     if (fs.existsSync(SESSIONS_FILE)) {
       const content = fs.readFileSync(SESSIONS_FILE, "utf-8");
       const sessionsArr: ChatSession[] = JSON.parse(content);
-      if (Array.isArray(sessionsArr) && sessionsArr.length > 0) {
+      if (Array.isArray(sessionsArr)) {
         for (const s of sessionsArr) {
-          if (s && s.id) {
-            store.set(s.id, s);
+          if (!s || !s.id) continue;
+          // Strictly isolate: only restore sessions with an explicit owner (never legacy unowned/global guest chats)
+          const ownerId = s.ownerId || (s.userEmail ? `user:${s.userEmail.toLowerCase().trim()}` : undefined);
+          if (ownerId) {
+            store.set(s.id, { ...s, ownerId });
           }
         }
       }
     }
 
-    // Also load any per-user email session files in DATA_DIR
+    // Also load per-user email session files in DATA_DIR
     if (fs.existsSync(DATA_DIR)) {
       const files = fs.readdirSync(DATA_DIR);
       for (const f of files) {
         if (f.startsWith("sessions_") && f.endsWith(".json")) {
+          const safePath = resolveSafeDataPath(f);
+          if (!safePath) continue;
           try {
-            const raw = fs.readFileSync(path.join(DATA_DIR, f), "utf-8");
+            const raw = fs.readFileSync(safePath, "utf-8");
             const uArr: ChatSession[] = JSON.parse(raw);
             if (Array.isArray(uArr)) {
               for (const s of uArr) {
-                if (s && s.id) {
-                  store.set(s.id, s);
-                }
+                if (!s || !s.id || !s.userEmail) continue;
+                const cleanEmail = s.userEmail.toLowerCase().trim();
+                store.set(s.id, { ...s, userEmail: cleanEmail, ownerId: `user:${cleanEmail}` });
               }
             }
           } catch {}
         }
       }
     }
-
-    if (store.size > 0) {
-      return store;
-    }
   } catch (e) {
     console.warn("Could not read chat_sessions.json:", e);
   }
 
-  // Fallback initial default session (generic, isolated per guest or newly authenticated user)
-  const initSession: ChatSession = {
-    id: defaultSessionId,
-    title: "UZUNITED AI Boshlang'ich Suhbat",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    userEmail: undefined,
-    messages: [
-      {
-        id: "msg-0",
-        role: "assistant",
-        content: "Assalomu alaykum! Men **UZUNITED AI** — mustaqil xotiraga va o'tmishdagi barcha suhbatlarimiz tarixini eslab qolish qobiliyatiga ega aqlli assistentman. \n\nMenga xohlagan savolingizni berishingiz mumkin, profilingiz va qiziqishlaringizni doimiy xotiramda saqlab boraman!",
-        timestamp: new Date().toISOString(),
-      }
-    ],
-    entityMemory: {},
-  };
-  store.set(defaultSessionId, initSession);
-
   return store;
 }
 
-function saveSessions(store: Map<string, ChatSession>) {
+function saveSessions(store: Map<string, ChatSession>, touchedEmail?: string | null) {
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    const arr = Array.from(store.values());
-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(arr, null, 2), "utf-8");
+    // Persist ONLY owned sessions (never unowned/public chats)
+    const ownedArr = Array.from(store.values()).filter((s) => Boolean(s.ownerId));
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(ownedArr, null, 2), "utf-8");
 
     // Partition and write per-email session files for permanent email persistence
     const byEmail: Record<string, ChatSession[]> = {};
-    for (const s of arr) {
+    for (const s of ownedArr) {
       if (s.userEmail) {
         const cleanEmail = s.userEmail.toLowerCase().trim();
         if (!byEmail[cleanEmail]) byEmail[cleanEmail] = [];
         byEmail[cleanEmail].push(s);
+      }
+    }
+    if (touchedEmail) {
+      const cleanTouched = touchedEmail.toLowerCase().trim();
+      if (!byEmail[cleanTouched]) {
+        byEmail[cleanTouched] = [];
       }
     }
     for (const [email, userSessions] of Object.entries(byEmail)) {
@@ -271,35 +543,44 @@ function saveSessions(store: Map<string, ChatSession>) {
   }
 }
 
-function loadAiMemory(): AiMemoryData {
+function loadAiMemory(ownerId?: string | null): AiMemoryData {
+  const memPath = getOwnerMemoryFilePath(ownerId);
+  if (!memPath) return { facts: [] };
   try {
-    if (fs.existsSync(AI_MEMORY_FILE)) {
-      const content = fs.readFileSync(AI_MEMORY_FILE, "utf-8");
+    if (fs.existsSync(memPath)) {
+      const content = fs.readFileSync(memPath, "utf-8");
       const parsed = JSON.parse(content);
       if (parsed && Array.isArray(parsed.facts)) {
         return parsed;
       }
     }
   } catch (e) {
-    console.warn("Could not read ai_memory.json:", e);
+    console.warn("Could not read owner ai_memory file:", e);
   }
   return { facts: [] };
 }
 
-function saveAiMemory(data: AiMemoryData) {
+function saveAiMemory(ownerId: string | null | undefined, data: AiMemoryData) {
+  const memPath = getOwnerMemoryFilePath(ownerId);
+  if (!memPath) return;
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
     data.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(AI_MEMORY_FILE, JSON.stringify(data, null, 2), "utf-8");
+    fs.writeFileSync(memPath, JSON.stringify(data, null, 2), "utf-8");
   } catch (e) {
-    console.warn("Could not write ai_memory.json:", e);
+    console.warn("Could not write owner ai_memory file:", e);
   }
 }
 
-function addAiMemoryFact(factText: string, category: "preference" | "fact" | "work" | "bio" | "general" = "fact"): boolean {
+function addAiMemoryFact(
+  ownerId: string | null | undefined,
+  factText: string,
+  category: "preference" | "fact" | "work" | "bio" | "general" = "fact"
+): boolean {
+  if (!ownerId) return false;
   const cleanFact = factText.trim();
   if (cleanFact.length < 2) return false;
-  const memory = loadAiMemory();
+  const memory = loadAiMemory(ownerId);
   const exists = memory.facts.some(f => f.fact.toLowerCase() === cleanFact.toLowerCase());
   if (!exists) {
     memory.facts.push({
@@ -308,63 +589,64 @@ function addAiMemoryFact(factText: string, category: "preference" | "fact" | "wo
       category,
       createdAt: new Date().toISOString(),
     });
-    saveAiMemory(memory);
+    saveAiMemory(ownerId, memory);
     return true;
   }
   return false;
 }
 
-function deleteAiMemoryFact(id: string): boolean {
-  const memory = loadAiMemory();
+function deleteAiMemoryFact(ownerId: string | null | undefined, id: string): boolean {
+  if (!ownerId) return false;
+  const memory = loadAiMemory(ownerId);
   const initialLen = memory.facts.length;
   memory.facts = memory.facts.filter(f => f.id !== id);
   if (memory.facts.length !== initialLen) {
-    saveAiMemory(memory);
+    saveAiMemory(ownerId, memory);
     return true;
   }
   return false;
 }
 
-// Auto-extract personal facts from chat
-function autoExtractAndSaveFacts(text: string, profile?: UserProfileData | null) {
+// Auto-extract personal facts strictly into the current owner's isolated memory
+function autoExtractAndSaveFacts(ownerId: string | null | undefined, text: string, profile?: UserProfileData | null) {
+  if (!ownerId) return;
   const lower = text.toLowerCase().trim();
   
   // Name
   if (lower.startsWith("mening ismim ") || lower.startsWith("ismim ")) {
     const name = text.replace(/^(?:mening\s+)?ismim\s+/i, "").replace(/[.,!]/g, "").trim();
     if (name.length > 1 && name.length < 30) {
-      addAiMemoryFact(`Foydalanuvchining ismi: ${name}`, "bio");
+      addAiMemoryFact(ownerId, `Foydalanuvchining ismi: ${name}`, "bio");
     }
   }
   // Profession / Role
   else if (lower.includes("men dasturchiman") || lower.includes("men dasturchi") || lower.includes("dasturlash bilan shug'ullanaman")) {
-    addAiMemoryFact("Foydalanuvchi dasturchi / IT sohasida ishlaydi", "work");
+    addAiMemoryFact(ownerId, "Foydalanuvchi dasturchi / IT sohasida ishlaydi", "work");
   }
   else if (lower.includes("men talabaman") || lower.includes("talabaman") || lower.includes("universitetda o'qiyman")) {
-    addAiMemoryFact("Foydalanuvchi talaba", "bio");
+    addAiMemoryFact(ownerId, "Foydalanuvchi talaba", "bio");
   }
   else if (lower.includes("men maktabda o'qiyman") || lower.includes("o'quvchiman")) {
-    addAiMemoryFact("Foydalanuvchi maktab o'quvchisi", "bio");
+    addAiMemoryFact(ownerId, "Foydalanuvchi maktab o'quvchisi", "bio");
   }
   // Location
   else if (lower.startsWith("men ") && (lower.includes("yashayman") || lower.includes("turaman"))) {
-    addAiMemoryFact(text.trim(), "bio");
+    addAiMemoryFact(ownerId, text.trim(), "bio");
   }
 
-  // Profile fields auto-sync
+  // Profile fields auto-sync (strictly within this owner's own memory)
   if (profile) {
     if (profile.firstName) {
-      addAiMemoryFact(`Foydalanuvchi ismi: ${profile.firstName} ${profile.lastName || ""}`.trim(), "bio");
+      addAiMemoryFact(ownerId, `Foydalanuvchi ismi: ${profile.firstName} ${profile.lastName || ""}`.trim(), "bio");
     }
     if (profile.interests && profile.interests.length > 0) {
-      profile.interests.forEach(i => addAiMemoryFact(`Qiziqishi: ${i}`, "preference"));
+      profile.interests.forEach(i => addAiMemoryFact(ownerId, `Qiziqishi: ${i}`, "preference"));
     }
   }
 }
 
-// Initialize memoryStore with persistent storage from disk
+// Initialize memoryStore with persistent storage from disk (only owned sessions)
 const memoryStore: Map<string, ChatSession> = loadSavedSessions();
-// Ensure sessions file is immediately persisted on disk
 saveSessions(memoryStore);
 
 // Fuzzy Uzbek Typo & Missing Letter Normalizer
@@ -773,13 +1055,14 @@ let globalAdminDirectives: ServerAdminDirective[] = [];
 
 // Synthesis using Gemini 3.8 Flash (with Google Search Grounding & Multimodal Vision) or built-in Local AI engine
 async function generateAIAnswer(params: {
+  ownerId: string | null;
   userQuery: string;
   resolvedQuery: string;
   history: ChatMessage[];
   sources?: Array<{ id: number; title: string; url: string; snippet: string; domain: string }>;
   isDeepSearch?: boolean;
   needsWeb?: boolean;
-  userProfile?: UserProfileData;
+  userProfile?: UserProfileData | null;
   attachments?: FileAttachmentData[];
 }): Promise<{ 
   answer: string; 
@@ -788,6 +1071,7 @@ async function generateAIAnswer(params: {
   newLearnedPreferences?: string[];
 }> {
   const { 
+    ownerId,
     userQuery, 
     resolvedQuery, 
     history, 
@@ -839,7 +1123,7 @@ async function generateAIAnswer(params: {
       .trim();
 
     if (memoryItem.length >= 2) {
-      addAiMemoryFact(memoryItem, "fact");
+      addAiMemoryFact(ownerId, memoryItem, "fact");
       reasoningSteps.push(`Foydalanuvchi ma'lumotni doimiy xotiraga yozishni so'radi: "${memoryItem}"`);
       return {
         answer: `Tushundim, buni doimiy backend xotiramda eslab qoldim: **«${memoryItem}»**! 🧠 Keyingi barcha suhbatlarimizda ham buni eslab turaman. ✨`,
@@ -873,13 +1157,13 @@ async function generateAIAnswer(params: {
 
   if (isMemoryQuery) {
     reasoningSteps.push("Doimiy backend xotiradagi ma'lumotlar so'rovi aniqlandi.");
-    const aiMemory = loadAiMemory();
+    const aiMemory = loadAiMemory(ownerId);
     const diskFacts = aiMemory.facts.map(f => f.fact);
     const profilePrefs = userProfile?.learnedPreferences || [];
     const allCombined = Array.from(new Set([...diskFacts, ...profilePrefs])).filter(Boolean);
 
     const firstName = userProfile?.firstName?.trim() || "";
-    let memoryReply = `Ha, albatta! Men sizni va barcha suhbatlarimiz tarixini backend doimiy xotiramda saqlab boryapman.\n\n`;
+    let memoryReply = `Ha, albatta! Men faqat sizning shaxsiy xotirangizni alohida saqlab boryapman.\n\n`;
     if (firstName) {
       memoryReply += `👤 **Ismingiz:** ${firstName} ${userProfile?.lastName || ""}\n`;
     }
@@ -891,7 +1175,7 @@ async function generateAIAnswer(params: {
     }
 
     if (allCombined.length > 0) {
-      memoryReply += `\n🧠 **Siz haqingizda doimiy xotirada saqlangan faktlar va qiziqishlar:**\n`;
+      memoryReply += `\n🧠 **Siz haqingizda xotirada saqlangan faktlar va qiziqishlar:**\n`;
       allCombined.forEach(f => {
         memoryReply += `• ${f}\n`;
       });
@@ -899,8 +1183,10 @@ async function generateAIAnswer(params: {
       memoryReply += `\nHozircha qo'shimcha shaxsiy xotira yozuvlari yo'q. Biror narsani doimiy yodda saqlashimni istasangiz, masalan: *«Shuni eslab qol: men dasturchiman»* deb yozishingiz mumkin.`;
     }
 
-    const totalSessions = memoryStore.size;
-    memoryReply += `\n💾 **Suhbatlar tarixi:** Serverda jami **${totalSessions} ta suhbat** xavfsiz saqlanmoqda.`;
+    const totalSessions = ownerId
+      ? Array.from(memoryStore.values()).filter(s => s.ownerId === ownerId).length
+      : 0;
+    memoryReply += `\n💾 **Suhbatlar tarixi:** Sizning hisobingizda jami **${totalSessions} ta suhbat** alohida saqlanmoqda.`;
 
     return {
       answer: memoryReply,
@@ -940,9 +1226,9 @@ async function generateAIAnswer(params: {
     .map(m => `${m.role === "user" ? "Foydalanuvchi" : "UZUNITED AI"}: ${m.content}`)
     .join("\n");
 
-  // User memory and personalization from backend disk storage
+  // User memory and personalization from strictly owner-scoped backend disk storage
   const userFirstName = userProfile?.firstName?.trim() || "";
-  const aiMemory = loadAiMemory();
+  const aiMemory = loadAiMemory(ownerId);
   const allSavedFacts = Array.from(new Set([
     ...(userProfile?.learnedPreferences || []),
     ...aiMemory.facts.map(f => f.fact),
@@ -951,7 +1237,7 @@ async function generateAIAnswer(params: {
   const detectedPrefs = extractLearnedPreferences(userQuery, allSavedFacts);
   if (detectedPrefs.length > 0) {
     reasoningSteps.push(`Foydalanuvchining yangi eslab qolish buyrug'i qabul qilindi: ${detectedPrefs.join(', ')}`);
-    detectedPrefs.forEach(p => addAiMemoryFact(p, "preference"));
+    detectedPrefs.forEach(p => addAiMemoryFact(ownerId, p, "preference"));
   }
 
   let userContextPrompt = "";
@@ -1312,33 +1598,25 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// 2. Main Chat endpoint
+// 2. Main Chat endpoint (strictly owner-isolated)
 app.post("/api/chat", async (req, res) => {
   try {
+    const owner = resolveRequestOwner(req);
     const { 
-      sessionId = defaultSessionId, 
+      sessionId, 
       message = "", 
       content = "",
       isDeepSearch = false, 
       customModel = "llama3.2:3b", 
       isAiMode = true,
-      userProfile: reqUserProfile,
-      user: fallbackUser,
       attachments = [],
-      adminDirectives = [],
-      isAdminMode = false,
     } = req.body;
 
-    const userEmail = (
-      req.body.email ||
-      req.body.userEmail ||
-      reqUserProfile?.email ||
-      fallbackUser?.email ||
-      (req.headers["x-user-email"] as string)
-    )?.toString().trim().toLowerCase();
+    if (!owner.ownerId) {
+      return res.status(401).json({ error: "Suhbatlashish uchun sessiya identifikatori topilmadi." });
+    }
 
-    const userProfile = reqUserProfile || fallbackUser || (userEmail ? getUserByEmail(userEmail) : null);
-
+    const userProfile = owner.isAuthenticated && owner.email ? getUserByEmail(owner.email) : null;
     const rawMessage = (message || content || "").toString().trim();
 
     if (!rawMessage && (!attachments || attachments.length === 0)) {
@@ -1351,21 +1629,28 @@ app.post("/api/chat", async (req, res) => {
           ? (attachments[0].isImage ? "Ushbu yuborilgan rasmni batafsil tushuntirib, tahlil qilib bering." : `Ushbu "${attachments[0].name}" faylini tahlil qiling.`)
           : "Salom");
 
-    // Get or create session
-    let session = memoryStore.get(sessionId);
+    const targetSessionId =
+      typeof sessionId === "string" && sessionId.trim() && sessionId !== "default-uzunited-session"
+        ? sessionId.trim()
+        : `session-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+
+    // Get or create strictly owner-isolated session
+    let session = memoryStore.get(targetSessionId);
+    if (session && session.ownerId !== owner.ownerId) {
+      return res.status(403).json({ error: "Ushbu suhbatga kirish huquqingiz yo‘q." });
+    }
     if (!session) {
       session = {
-        id: sessionId,
+        id: targetSessionId,
         title: effectiveMessage.slice(0, 30) + (effectiveMessage.length > 30 ? "..." : ""),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-        userEmail: userEmail || undefined,
+        ownerId: owner.ownerId,
+        userEmail: owner.email || undefined,
         messages: [],
         entityMemory: {},
       };
-      memoryStore.set(sessionId, session);
-    } else if (userEmail && !session.userEmail) {
-      session.userEmail = userEmail;
+      memoryStore.set(targetSessionId, session);
     }
 
     const reasoningSteps: string[] = [];
@@ -1408,6 +1693,7 @@ app.post("/api/chat", async (req, res) => {
     // Step 3: Synthesis with Local AI / Google AI
     reasoningSteps.push(`7. Universal AI tahlili (${customModel}) va ma'lumotlar sintezi amalga oshirilmoqda...`);
     const aiResult = await generateAIAnswer({
+      ownerId: owner.ownerId,
       userQuery: effectiveMessage,
       resolvedQuery,
       history: session.messages,
@@ -1418,17 +1704,15 @@ app.post("/api/chat", async (req, res) => {
       attachments,
     });
 
-    // Append AI steps
     reasoningSteps.push(...aiResult.reasoning);
 
-    // Final sources (Google Search Grounding sources take priority if present)
     const finalSources = (aiResult.updatedSources && aiResult.updatedSources.length > 0) 
       ? aiResult.updatedSources 
       : sources;
     const hasActiveSources = finalSources.length > 0;
     const finalSearchedWeb = searchedWeb || hasActiveSources;
 
-    // Save to session memory
+    // Save to strictly owned session memory
     const userMsg: ChatMessage = {
       id: `msg-${Date.now()}-u`,
       role: "user",
@@ -1457,8 +1741,8 @@ app.post("/api/chat", async (req, res) => {
     memoryStore.set(session.id, session);
     saveSessions(memoryStore);
 
-    // Auto extract personal facts from user message
-    autoExtractAndSaveFacts(effectiveMessage, userProfile);
+    // Auto extract personal facts strictly for this owner
+    autoExtractAndSaveFacts(owner.ownerId, effectiveMessage, userProfile);
 
     res.json({
       sessionId: session.id,
@@ -1477,34 +1761,55 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-// User Profile and Account Persistence Endpoints
-// User Profile and Account Persistence Endpoints
-app.get("/api/user/profile", (req, res) => {
-  const reqEmail = (req.query.email as string || (req.headers["x-user-email"] as string))?.trim().toLowerCase();
-  if (!reqEmail) {
+// Current authenticated user (via HttpOnly cookie or Bearer token)
+app.get("/api/auth/me", (req, res) => {
+  const owner = resolveRequestOwner(req);
+  if (!owner.isAuthenticated || !owner.email) {
     return res.json({ user: null });
   }
-  const users = loadSavedUsers();
-  const existing = users[reqEmail];
-  if (existing) {
-    return res.json({ user: existing.profile });
+  const profile = getUserByEmail(owner.email);
+  return res.json({ user: profile });
+});
+
+// User Profile and Account Persistence Endpoints (authenticated owner only)
+app.get("/api/user/profile", (req, res) => {
+  const owner = resolveRequestOwner(req);
+  if (!owner.isAuthenticated || !owner.email) {
+    return res.json({ user: null });
   }
-  return res.json({ user: null });
+  const existing = getUserByEmail(owner.email);
+  return res.json({ user: existing });
 });
 
 app.post("/api/user/profile", (req, res) => {
-  const { profile } = req.body;
-  if (!profile || !profile.email) {
-    return res.status(400).json({ error: "Profile va email ma'lumotlari kiritilmadi" });
+  const owner = resolveRequestOwner(req);
+  if (!owner.isAuthenticated || !owner.email) {
+    return res.status(401).json({ error: "Profilni saqlash uchun tizimga kiring." });
   }
-  const cleanEmail = profile.email.toLowerCase().trim();
+  const { profile } = req.body;
+  if (!profile || typeof profile !== "object") {
+    return res.status(400).json({ error: "Profil ma'lumotlari kiritilmadi" });
+  }
+  const cleanEmail = owner.email;
   const users = loadSavedUsers();
+  const existingProfile = users[cleanEmail]?.profile || {};
+  const mergedProfile: UserProfileData = {
+    ...existingProfile,
+    firstName: profile.firstName ?? existingProfile.firstName,
+    lastName: profile.lastName ?? existingProfile.lastName,
+    birthYear: profile.birthYear ?? existingProfile.birthYear,
+    interests: Array.isArray(profile.interests) ? profile.interests : existingProfile.interests,
+    favoriteTopics: Array.isArray(profile.favoriteTopics) ? profile.favoriteTopics : existingProfile.favoriteTopics,
+    bio: profile.bio ?? existingProfile.bio,
+    learnedPreferences: Array.isArray(profile.learnedPreferences) ? profile.learnedPreferences : existingProfile.learnedPreferences,
+    email: cleanEmail,
+  };
   users[cleanEmail] = {
     ...(users[cleanEmail] || {}),
-    profile,
+    profile: mergedProfile,
   };
   saveUsers(users);
-  res.json({ success: true, user: profile });
+  res.json({ success: true, user: mergedProfile });
 });
 
 app.post("/api/auth/register", (req, res) => {
@@ -1512,12 +1817,18 @@ app.post("/api/auth/register", (req, res) => {
   if (!email || !password || !firstName) {
     return res.status(400).json({ error: "Barcha majburiy maydonlarni to'ldiring" });
   }
-  const cleanEmail = email.trim().toLowerCase();
+  if (typeof password !== "string" || password.length < 6) {
+    return res.status(400).json({ error: "Parol kamida 6 ta belgidan iborat bo'lishi kerak" });
+  }
+  const cleanEmail = String(email).trim().toLowerCase();
   const users = loadSavedUsers();
+  if (users[cleanEmail]) {
+    return res.status(409).json({ error: "Bu email allaqachon ro'yxatdan o'tgan. Tizimga kirish bo'limidan foydalaning." });
+  }
   
   const newUserProfile: UserProfileData = {
-    firstName: firstName.trim(),
-    lastName: lastName?.trim() || "",
+    firstName: String(firstName).trim(),
+    lastName: String(lastName || "").trim(),
     email: cleanEmail,
     birthYear: String(birthYear || "2000"),
     interests: [],
@@ -1527,132 +1838,82 @@ app.post("/api/auth/register", (req, res) => {
 
   users[cleanEmail] = {
     profile: newUserProfile,
-    passwordHash: password,
+    passwordHash: hashPassword(password),
   };
   saveUsers(users);
 
-  res.json({ success: true, user: newUserProfile });
+  const token = createSessionToken(cleanEmail);
+  setAuthCookie(res, req, token);
+  res.json({ success: true, user: newUserProfile, token });
 });
 
 app.post("/api/auth/login", (req, res) => {
   const { email, password } = req.body;
-  if (!email) {
-    return res.status(400).json({ error: "Email manzilini kiriting" });
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email va parolni kiriting" });
   }
-  const cleanEmail = email.trim().toLowerCase();
+  const cleanEmail = String(email).trim().toLowerCase();
   const users = loadSavedUsers();
   const existing = users[cleanEmail];
 
-  if (existing) {
-    // If it's the author's email ishlash111@gmail.com, allow login seamlessly
-    if (cleanEmail === "ishlash111@gmail.com") {
-      if (password) {
-        existing.passwordHash = password;
-        saveUsers(users);
-      }
-      return res.json({ success: true, user: existing.profile });
-    }
-
-    if (existing.passwordHash && password && existing.passwordHash !== password) {
-      // If user provided a password and it doesn't match
-      return res.status(401).json({ error: "Parol noto'g'ri kiritildi. Agar parolingizni unutgan bo'lsangiz, 'Google orqali kirish' yoki yangi parol bilan kiring." });
-    }
-    return res.json({ success: true, user: existing.profile });
+  if (!existing) {
+    return res.status(401).json({ error: "Bunday email ro'yxatdan o'tmagan. Avval ro'yxatdan o'ting yoki Google orqali kiring." });
   }
 
-  // If new user logging in directly
-  const user: UserProfileData = {
-    firstName: cleanEmail.split("@")[0],
-    lastName: "",
-    email: cleanEmail,
-    birthYear: "2000",
-    interests: [],
-    learnedPreferences: [],
-    isGoogleUser: cleanEmail.endsWith("@gmail.com"),
-  };
-  users[cleanEmail] = {
-    profile: user,
-    passwordHash: password || "default123",
-  };
-  saveUsers(users);
+  if (existing.passwordHash?.startsWith("GOOGLE_AUTH_")) {
+    return res.status(401).json({ error: "Ushbu hisob Google orqali ro'yxatdan o'tgan. Iltimos, 'Google hisobi orqali kirish' tugmasidan foydalaning." });
+  }
 
-  res.json({ success: true, user });
+  const check = verifyPassword(String(password), existing.passwordHash);
+  if (!check.valid) {
+    return res.status(401).json({ error: "Parol noto'g'ri kiritildi." });
+  }
+  if (check.needsRehash) {
+    existing.passwordHash = hashPassword(String(password));
+    saveUsers(users);
+  }
+
+  const token = createSessionToken(cleanEmail);
+  setAuthCookie(res, req, token);
+  return res.json({ success: true, user: existing.profile, token });
 });
 
-// Google Sign-In Authentication Endpoint
-app.post("/api/auth/google", (req, res) => {
+// Google Sign-In Authentication Endpoint (server-side verified with Google)
+app.post("/api/auth/google", async (req, res) => {
   try {
-    const { credential, email: directEmail, firstName: directFirst, lastName: directLast, avatar: directAvatar, googleId } = req.body;
-    let email = directEmail;
-    let firstName = directFirst;
-    let lastName = directLast;
-    let avatar = directAvatar;
+    const { credential, accessToken } = req.body;
+    const verified = await verifyGoogleAuth({ credential, accessToken });
 
-    // Decode Google JWT if provided
-    if (credential && typeof credential === "string") {
-      const decoded = decodeGoogleCredential(credential);
-      if (decoded) {
-        if (!email && decoded.email) email = decoded.email;
-        if (!firstName && decoded.given_name) firstName = decoded.given_name;
-        if (!firstName && decoded.name) firstName = decoded.name.split(" ")[0];
-        if (!lastName && decoded.family_name) lastName = decoded.family_name;
-        if (!lastName && decoded.name) lastName = decoded.name.split(" ").slice(1).join(" ");
-        if (!avatar && decoded.picture) avatar = decoded.picture;
-      }
+    if (!verified || !verified.email) {
+      return res.status(401).json({ error: "Google hisobini tasdiqlab bo'lmadi. Iltimos, qaytadan urinib ko'ring." });
     }
 
-    if (!email) {
-      return res.status(400).json({ error: "Google hisobidan email ma'lumoti olinmadi" });
-    }
-
-    const cleanEmail = email.trim().toLowerCase();
+    const cleanEmail = verified.email;
     const users = loadSavedUsers();
     const existing = users[cleanEmail]?.profile;
 
     const userProfile: UserProfileData = {
-      firstName: firstName?.trim() || existing?.firstName || cleanEmail.split("@")[0],
-      lastName: lastName?.trim() || existing?.lastName || "",
+      firstName: verified.firstName?.trim() || existing?.firstName || cleanEmail.split("@")[0],
+      lastName: verified.lastName?.trim() || existing?.lastName || "",
       email: cleanEmail,
       birthYear: existing?.birthYear || "2000",
       interests: existing?.interests || [],
       favoriteTopics: existing?.favoriteTopics || [],
       bio: existing?.bio || "Google orqali tasdiqlangan hisob",
       learnedPreferences: existing?.learnedPreferences || [],
-      avatar: avatar || existing?.avatar,
+      avatar: verified.avatar || existing?.avatar,
       isGoogleUser: true,
     };
 
     users[cleanEmail] = {
       profile: userProfile,
-      passwordHash: users[cleanEmail]?.passwordHash || `GOOGLE_AUTH_${googleId || Date.now()}`,
+      passwordHash: users[cleanEmail]?.passwordHash || `GOOGLE_AUTH_${verified.sub || Date.now()}`,
     };
     saveUsers(users);
 
-    // Ensure this user has at least one personalized chat session
-    const userSessions = Array.from(memoryStore.values()).filter(s => s.userEmail?.toLowerCase() === cleanEmail);
-    if (userSessions.length === 0) {
-      const initialId = `session-${Date.now()}`;
-      const newSession: ChatSession = {
-        id: initialId,
-        title: "UZUNITED AI Boshlang'ich Suhbat",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        userEmail: cleanEmail,
-        messages: [
-          {
-            id: `msg-${Date.now()}`,
-            role: "assistant",
-            content: `Assalomu alaykum, **${userProfile.firstName}**! 🎉 Google hisobingiz (${cleanEmail}) orqali muvaffaqiyatli kirdingiz.\n\nMen **UZUNITED AI** man. Endi barcha suhbatlaringiz, eslab qolingan mavzular va chat tarixingiz faqat sizning shaxsiy profilingizda xavfsiz saqlanadi. Qanday savolingiz bor yoki nima haqida suhbatlashamiz? 😊`,
-            timestamp: new Date().toISOString(),
-          }
-        ],
-        entityMemory: {},
-      };
-      memoryStore.set(initialId, newSession);
-      saveSessions(memoryStore);
-    }
-
-    res.json({ success: true, user: userProfile });
+    const token = createSessionToken(cleanEmail);
+    setAuthCookie(res, req, token);
+    res.json({ success: true, user: userProfile, token });
   } catch (err: any) {
     console.error("Google Auth backend error:", err);
     res.status(500).json({ error: "Google orqali kirishda server xatoligi: " + err.message });
@@ -1660,6 +1921,7 @@ app.post("/api/auth/google", (req, res) => {
 });
 
 app.post("/api/auth/logout", (req, res) => {
+  clearAuthCookie(res, req);
   res.json({ success: true });
 });
 
@@ -1688,105 +1950,93 @@ app.post("/api/search", async (req, res) => {
   }
 });
 
-// 4. Memory Sessions list (strictly isolated by user email)
+// 4. Memory Sessions list (strictly isolated by verified ownerId)
 app.get("/api/memory/sessions", (req, res) => {
-  const queryEmail = (req.query.email as string || (req.headers["x-user-email"] as string))?.trim().toLowerCase();
-  const sessions = Array.from(memoryStore.values());
+  const owner = resolveRequestOwner(req);
+  if (!owner.ownerId) {
+    return res.json({ sessions: [] });
+  }
 
-  if (queryEmail) {
-    let userSessions = sessions.filter(s => s.userEmail?.toLowerCase() === queryEmail);
+  const userSessions = Array.from(memoryStore.values()).filter(
+    (s) => s.ownerId === owner.ownerId
+  );
 
-    // If user has no sessions yet, create an initial personalized session for them
-    if (userSessions.length === 0) {
-      const initialId = `session-${Date.now()}`;
-      const newSession: ChatSession = {
-        id: initialId,
-        title: "UZUNITED AI Suhbat",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        userEmail: queryEmail,
-        messages: [
-          {
-            id: `msg-${Date.now()}`,
-            role: "assistant",
-            content: `Assalomu alaykum! Men **UZUNITED AI** man. Ushbu emailingiz (${queryEmail}) bo'yicha barcha suhbatlarimiz xavfsiz va shaxsiy saqlanadi. Qanday savolingiz bor yoki nima haqida gaplashamiz? 😊`,
-            timestamp: new Date().toISOString(),
-          }
-        ],
-        entityMemory: {},
-      };
-      memoryStore.set(initialId, newSession);
-      saveSessions(memoryStore);
-      userSessions = [newSession];
-    }
-
-    const list = userSessions.map(s => ({
+  const list = userSessions
+    .map((s) => ({
       id: s.id,
       title: s.title,
       messageCount: s.messages.length,
       createdAt: s.createdAt,
       updatedAt: s.updatedAt,
-      userEmail: s.userEmail,
       lastEntity: s.entityMemory?.lastEntity || null,
-    })).sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
-
-    return res.json({ sessions: list });
-  }
-
-  // Unauthenticated guest session list: only sessions without userEmail
-  const guestSessions = sessions.filter(s => !s.userEmail);
-  const list = guestSessions.map(s => ({
-    id: s.id,
-    title: s.title,
-    messageCount: s.messages.length,
-    createdAt: s.createdAt,
-    updatedAt: s.updatedAt,
-    userEmail: undefined,
-    lastEntity: s.entityMemory?.lastEntity || null,
-  })).sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    }))
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
 
   res.json({ sessions: list });
 });
 
-// 4b. Get specific session
+// 4b. Get specific session (strictly owner-checked)
 app.get("/api/memory/sessions/:id", (req, res) => {
-  const { id } = req.params;
-  const queryEmail = (req.query.email as string || (req.headers["x-user-email"] as string))?.trim().toLowerCase();
+  const owner = resolveRequestOwner(req);
+  if (!owner.ownerId) {
+    return res.status(401).json({ error: "Sessiya egasi aniqlanmadi." });
+  }
 
-  let session = memoryStore.get(id);
+  const { id } = req.params;
+  if (id === "default-uzunited-session") {
+    return res.status(404).json({ error: "Sessiya topilmadi." });
+  }
+
+  const session = memoryStore.get(id);
   if (!session) {
-    session = {
+    const freshSession: ChatSession = {
       id,
       title: "Yangi suhbat",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      userEmail: queryEmail || undefined,
+      ownerId: owner.ownerId,
+      userEmail: owner.email || undefined,
       messages: [],
       entityMemory: {},
     };
-    memoryStore.set(id, session);
+    memoryStore.set(id, freshSession);
     saveSessions(memoryStore);
-  } else if (!session.userEmail && queryEmail) {
-    session.userEmail = queryEmail;
-    saveSessions(memoryStore);
+    return res.json({ session: freshSession });
   }
+
+  if (session.ownerId !== owner.ownerId) {
+    return res.status(403).json({ error: "Bu suhbat boshqa foydalanuvchiga tegishli." });
+  }
+
   res.json({ session });
 });
 
-// 4c. Synchronize session messages from client
+// 4c. Synchronize session messages from client (strictly owner-checked)
 app.post("/api/memory/sessions/:id/sync", (req, res) => {
-  const { id } = req.params;
-  const { messages, title, email, userEmail } = req.body;
-  const targetEmail = (email || userEmail || (req.headers["x-user-email"] as string))?.toString().trim().toLowerCase();
+  const owner = resolveRequestOwner(req);
+  if (!owner.ownerId) {
+    return res.status(401).json({ error: "Sessiyani saqlash uchun autentifikatsiya talab etiladi." });
+  }
 
+  const { id } = req.params;
+  if (id === "default-uzunited-session") {
+    return res.status(400).json({ error: "Yaroqsiz sessiya ID." });
+  }
+
+  const { messages, title } = req.body;
   let session = memoryStore.get(id);
+  if (session && session.ownerId !== owner.ownerId) {
+    return res.status(403).json({ error: "Boshqa foydalanuvchi sessiyasini o‘zgartirish taqiqlangan." });
+  }
+
   if (!session) {
     session = {
       id,
       title: title || "Yangi suhbat",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      userEmail: targetEmail || undefined,
+      ownerId: owner.ownerId,
+      userEmail: owner.email || undefined,
       messages: Array.isArray(messages) ? messages : [],
       entityMemory: {},
     };
@@ -1797,9 +2047,6 @@ app.post("/api/memory/sessions/:id/sync", (req, res) => {
     if (title && (session.title === "Yangi suhbat" || !session.title)) {
       session.title = title;
     }
-    if (targetEmail && !session.userEmail) {
-      session.userEmail = targetEmail;
-    }
     session.updatedAt = new Date().toISOString();
   }
   memoryStore.set(id, session);
@@ -1807,28 +2054,41 @@ app.post("/api/memory/sessions/:id/sync", (req, res) => {
   res.json({ success: true, session });
 });
 
-// 4d. Delete specific session individually
+// 4d. Delete specific session individually (strictly owner-checked)
 app.delete("/api/memory/sessions/:id", (req, res) => {
+  const owner = resolveRequestOwner(req);
+  if (!owner.ownerId) {
+    return res.status(401).json({ error: "Autentifikatsiya talab etiladi." });
+  }
+
   const { id } = req.params;
-  const existed = memoryStore.has(id);
-  if (existed) {
+  const session = memoryStore.get(id);
+  if (session) {
+    if (session.ownerId !== owner.ownerId) {
+      return res.status(403).json({ error: "Boshqa foydalanuvchi suhbatini o‘chirish taqiqlangan." });
+    }
+    const deletedEmail = session.userEmail || owner.email;
     memoryStore.delete(id);
-    saveSessions(memoryStore);
+    saveSessions(memoryStore, deletedEmail);
   }
   res.json({ success: true, deletedId: id });
 });
 
-// 5. Clear or create new session
+// 5. Create new session (strictly owner-stamped)
 app.post("/api/memory/new-session", (req, res) => {
-  const reqEmail = (req.body?.email || req.body?.userEmail || req.query?.email as string || (req.headers["x-user-email"] as string))?.toString().trim().toLowerCase();
+  const owner = resolveRequestOwner(req);
+  if (!owner.ownerId) {
+    return res.status(401).json({ error: "Sessiya ochish uchun identifikator kerak." });
+  }
 
-  const newId = `session-${Date.now()}`;
+  const newId = `session-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
   const newSession: ChatSession = {
     id: newId,
     title: "Yangi suhbat",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    userEmail: reqEmail || undefined,
+    ownerId: owner.ownerId,
+    userEmail: owner.email || undefined,
     messages: [
       {
         id: `msg-${Date.now()}`,
@@ -1844,42 +2104,67 @@ app.post("/api/memory/new-session", (req, res) => {
   res.json({ session: newSession });
 });
 
-// 5b. Get AI long-term memory facts
+// 5b. Get AI long-term memory facts (strictly owner-isolated)
 app.get("/api/memory/facts", (req, res) => {
-  const memory = loadAiMemory();
+  const owner = resolveRequestOwner(req);
+  if (!owner.ownerId) {
+    return res.json({ facts: [] });
+  }
+  const memory = loadAiMemory(owner.ownerId);
   res.json({ facts: memory.facts || [] });
 });
 
-// 5c. Add a fact directly to memory
+// 5c. Add a fact directly to owner's isolated memory
 app.post("/api/memory/facts", (req, res) => {
+  const owner = resolveRequestOwner(req);
+  if (!owner.ownerId) {
+    return res.status(401).json({ error: "Fakt qo‘shish uchun autentifikatsiya kerak" });
+  }
   const { fact, category = "fact" } = req.body;
   if (!fact || typeof fact !== "string") {
     return res.status(400).json({ error: "Fakt matni kiritilmadi" });
   }
-  const added = addAiMemoryFact(fact, category);
-  const memory = loadAiMemory();
+  const added = addAiMemoryFact(owner.ownerId, fact, category);
+  const memory = loadAiMemory(owner.ownerId);
   res.json({ success: true, added, facts: memory.facts });
 });
 
-// 5d. Delete a fact from memory
+// 5d. Delete a fact from owner's isolated memory
 app.delete("/api/memory/facts/:id", (req, res) => {
+  const owner = resolveRequestOwner(req);
+  if (!owner.ownerId) {
+    return res.status(401).json({ error: "Autentifikatsiya kerak" });
+  }
   const { id } = req.params;
-  const deleted = deleteAiMemoryFact(id);
-  const memory = loadAiMemory();
+  const deleted = deleteAiMemoryFact(owner.ownerId, id);
+  const memory = loadAiMemory(owner.ownerId);
   res.json({ success: true, deleted, facts: memory.facts });
 });
 
-// 6. Test local Ollama / LM Studio connection
+// 6. Test local Ollama / LM Studio connection (strict localhost allowlist to block SSRF)
 app.post("/api/test-local-llm", async (req, res) => {
-  const { url = "http://localhost:11434" } = req.body;
+  const rawUrl = typeof req.body?.url === "string" ? req.body.url : "http://localhost:11434";
+  let safeHostUrl = "http://localhost:11434";
+  try {
+    const parsed = new URL(rawUrl);
+    const allowedHosts = new Set(["localhost", "127.0.0.1"]);
+    const allowedPorts = new Set(["11434", "1234", ""]);
+    if (parsed.protocol !== "http:" || !allowedHosts.has(parsed.hostname) || !allowedPorts.has(parsed.port)) {
+      return res.status(400).json({ connected: false, message: "Faqat lokal Ollama/LM Studio manziliga ruxsat beriladi." });
+    }
+    safeHostUrl = `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return res.status(400).json({ connected: false, message: "Yaroqsiz lokal server manzili." });
+  }
+
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3000);
-    const checkRes = await fetch(`${url}/api/tags`, { signal: controller.signal });
+    const checkRes = await fetch(`${safeHostUrl}/api/tags`, { signal: controller.signal });
     clearTimeout(timeout);
     if (checkRes.ok) {
       const data = await checkRes.json();
-      return res.json({ connected: true, models: data.models || [], host: url });
+      return res.json({ connected: true, models: data.models || [], host: safeHostUrl });
     }
     return res.json({ connected: false, message: `Ollama status: ${checkRes.statusText}` });
   } catch (err: any) {
